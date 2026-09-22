@@ -1,0 +1,40 @@
+name: windows-build
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore NuGet packages
+        run: nuget restore "M3U8 Downloader.sln"
+
+      - name: Build Release
+        run: msbuild "M3U8 Downloader.sln" /p:Configuration=Release /p:Platform=x86 /v:m
+
+      - name: Stage ffmpeg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/Tools | Out-Null
+          $gz = "$env:RUNNER_TEMP/ffmpeg-win32-x64.gz"
+          Invoke-WebRequest -Uri "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-win32-x64.gz" -OutFile $gz
+          tar -xzf $gz -C "$env:RUNNER_TEMP"
+          if (-not (Test-Path "$env:RUNNER_TEMP/ffmpeg-win32-x64")) { throw "ffmpeg binary missing after extract" }
+          Copy-Item "$env:RUNNER_TEMP/ffmpeg-win32-x64" dist/Tools/ffmpeg.exe
+          Copy-Item "M3U8 Downloader/bin/Release/M3U8 Downloader.exe" dist/
+          Copy-Item "M3U8 Downloader/bin/Release/*.dll" dist/ -ErrorAction SilentlyContinue
+          Copy-Item "M3U8 Downloader/bin/Release/*.config" dist/ -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: M3U8-Downloader-win-x86
+          path: dist/
+          if-no-files-found: error

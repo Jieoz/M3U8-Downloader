@@ -427,7 +427,26 @@ namespace M3U8_Downloader
         string[] m_urlList;
         int m_count;
         string m_outPut;
-        
+
+        private string BuildCommand(int index)
+        {
+            string line = (m_urlList[index] ?? "").Trim();
+            string roomId;
+            string input = line;
+            if (BilibiliLive.TryParseRoomId(line, out roomId))
+            {
+                LiveStream stream = BilibiliLive.Resolve(roomId);
+                input = stream.Url;
+                m_outPut += "Bilibili live " + roomId + " " + stream.FormatName + "/" + stream.CodecName + " qn=" + stream.Quality + "\r\n";
+            }
+            string output = m_path + "\\" + textBox_Name.Text + index.ToString() + ".mp4";
+            string proxy = menu_Proxy.Checked ? m_proxy : null;
+            if (BilibiliLive.TryParseRoomId(line, out roomId))
+                return BilibiliLive.BuildRecordCommand(input, output, proxy);
+            if (!string.IsNullOrWhiteSpace(proxy))
+                return "-http_proxy \"" + proxy + "\" -rw_timeout 10000000 -i \"" + input + "\" -c copy -y -bsf:a aac_adtstoasc -movflags +faststart \"" + output + "\"";
+            return "-rw_timeout 10000000 -i \"" + input + "\" -c copy -y -bsf:a aac_adtstoasc -movflags +faststart \"" + output + "\"";
+        }
 
         private void Download()
         {
@@ -442,15 +461,7 @@ namespace M3U8_Downloader
             m_urlList = Regex.Split(textBox_Adress.Text, Environment.NewLine, RegexOptions.IgnoreCase);
             m_count = 0;
 
-            string command;
-            if (menu_Proxy.Checked)
-            {
-                command = "-http_proxy " + m_proxy + " -rw_timeout 10000000 -i " + "\"" + m_urlList[0] + "\"" + " -c copy -y -bsf:a aac_adtstoasc -movflags +faststart " + "\"" + m_path + "\\" + textBox_Name.Text + m_count.ToString() + ".mp4" + "\"";
-            }
-            else
-            {
-                command = "-rw_timeout 10000000 -i " + "\"" + m_urlList[0] + "\"" + " -c copy -y -bsf:a aac_adtstoasc -movflags +faststart " + "\"" + m_path + "\\" + textBox_Name.Text + m_count.ToString() + ".mp4" + "\"";
-            }
+            string command = BuildCommand(0);
 
             // 启动进程执行相应命令,此例中以执行ffmpeg.exe为例  
             RealAction(@"Tools\ffmpeg.exe", command);
@@ -556,15 +567,7 @@ namespace M3U8_Downloader
                 windowsTaskbar.SetProgressValue(0, 100, this.Handle);
                 Application.DoEvents();
 
-                string command;
-                if (menu_Proxy.Checked)
-                {
-                    command = "-http_proxy " + m_proxy + " -rw_timeout 10000000 -i " + "\"" + m_urlList[m_count] + "\"" + " -c copy -y -bsf:a aac_adtstoasc -movflags +faststart " + "\"" + m_path + "\\" + textBox_Name.Text + m_count.ToString() + ".mp4" + "\"";
-                }
-                else
-                {
-                    command = "-rw_timeout 10000000 -i " + "\"" + m_urlList[m_count] + "\"" + " -c copy -y -bsf:a aac_adtstoasc -movflags +faststart " + "\"" + m_path + "\\" + textBox_Name.Text + m_count.ToString() + ".mp4" + "\"";
-                }
+                string command = BuildCommand(m_count);
 
                 
                 RealAction(@"Tools\ffmpeg.exe", command);
