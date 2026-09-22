@@ -24,12 +24,16 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist/Tools | Out-Null
-          $exe = "$env:RUNNER_TEMP/ffmpeg-win32-x64.exe.gz"
-          Invoke-WebRequest -Uri "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-win32-x64.exe.gz" -OutFile $exe
-          tar -xzf $exe -C "$env:RUNNER_TEMP"
-          $bin = Get-ChildItem "$env:RUNNER_TEMP" -Filter "ffmpeg*.exe" | Select-Object -First 1
-          if (-not $bin) { throw "ffmpeg.exe missing after extract" }
-          Copy-Item $bin.FullName dist/Tools/ffmpeg.exe
+          $gz = "$env:RUNNER_TEMP/ffmpeg-win32-x64.gz"
+          Invoke-WebRequest -Uri "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-win32-x64.gz" -OutFile $gz
+          $raw = [System.IO.File]::ReadAllBytes($gz)
+          $inputStream = New-Object System.IO.MemoryStream(,$raw)
+          $gzip = New-Object System.IO.Compression.GzipStream($inputStream, [System.IO.Compression.CompressionMode]::Decompress)
+          $outPath = "dist/Tools/ffmpeg.exe"
+          $output = [System.IO.File]::Create($outPath)
+          $gzip.CopyTo($output)
+          $output.Dispose(); $gzip.Dispose(); $inputStream.Dispose()
+          if ((Get-Item $outPath).Length -lt 1000000) { throw "ffmpeg.exe is too small" }
           Copy-Item "M3U8 Downloader/bin/Release/M3U8 Downloader.exe" dist/
           Copy-Item "M3U8 Downloader/bin/Release/*.dll" dist/ -ErrorAction SilentlyContinue
           Copy-Item "M3U8 Downloader/bin/Release/*.config" dist/ -ErrorAction SilentlyContinue
