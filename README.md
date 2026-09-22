@@ -4,7 +4,7 @@ Fork of [magicdmer/M3U8-Downloader](https://github.com/magicdmer/M3U8-Downloader
 
 ## 现在还适不适合用
 
-原程序只做一件事：把你已经拿到的 m3u8 地址交给 `Tools\ffmpeg.exe`，`-c copy` 合成 mp4。它不解析网页，也不带站点请求头。
+原程序只做一件事：把你已经拿到的 m3u8 地址交给 `Tools\ffmpeg.exe`，`-c copy` 合成 mp4。它不解析网页，也不带站点请求头。本 fork 当前版本 2.2.0。
 
 仍然适用：
 
@@ -14,7 +14,7 @@ Fork of [magicdmer/M3U8-Downloader](https://github.com/magicdmer/M3U8-Downloader
 
 已经过时、不能当通用下载器：
 
-- 只编译到 .NET Framework 4.6，Windows 桌面，x86
+- 只编译到 .NET Framework 4.8，Windows 桌面，x86
 - README 里的 ffmpeg 下载站（ffmpeg.zeranoe.com）已关
 - 不支持 AES-128、fMP4/DASH、自定义 Header、主播放列表选画质
 - 进度条靠解析 ffmpeg 的 Duration。直播没有总时长，进度会失真，不限时录会一直跑到你按停止
