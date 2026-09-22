@@ -24,6 +24,10 @@ namespace M3U8_Downloader
             @"^https?://live\.bilibili\.com/(?:blanc/|h5/)?(?<id>\d+)/?(?:[?#].*)?$",
             RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+        static readonly Regex ShareUrl = new Regex(
+            @"https?://(?:b23\.tv|bili2233\.cn)/(?<code>[A-Za-z0-9]+)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
         public static bool TryParseRoomId(string input, out string roomId)
         {
             roomId = null;
@@ -41,7 +45,15 @@ namespace M3U8_Downloader
                 roomId = input;
                 return true;
             }
-            return false;
+            Match share = ShareUrl.Match(input);
+            if (!share.Success)
+                return false;
+            string landed = ExpandShareUrl("https://b23.tv/" + share.Groups["code"].Value);
+            match = RoomUrl.Match(landed);
+            if (!match.Success)
+                return false;
+            roomId = match.Groups["id"].Value;
+            return true;
         }
 
         public static string BuildPlayInfoUrl(string roomId)
@@ -114,16 +126,31 @@ namespace M3U8_Downloader
                             CodecName = ToString(codec, "codec_name"),
                             Quality = ToInt(codec, "current_qn", 0)
                         };
-                        bool preferred = string.Equals(formatName, "ts", StringComparison.OrdinalIgnoreCase)
-                            && string.Equals(candidate.CodecName, "avc", StringComparison.OrdinalIgnoreCase);
-                        if (preferred && (fallback == null || candidate.Quality >= fallback.Quality))
-                            fallback = candidate;
-                        else if (fallback == null)
+                        if (Better(candidate, fallback))
                             fallback = candidate;
                     }
                 }
             }
             return fallback;
+        }
+
+        static bool Better(LiveStream candidate, LiveStream current)
+        {
+            if (current == null)
+                return true;
+            if (candidate.Quality != current.Quality)
+                return candidate.Quality > current.Quality;
+            return Rank(candidate) > Rank(current);
+        }
+
+        static int Rank(LiveStream stream)
+        {
+            int rank = 0;
+            if (string.Equals(stream.CodecName, "avc", StringComparison.OrdinalIgnoreCase))
+                rank += 2;
+            if (string.Equals(stream.FormatName, "ts", StringComparison.OrdinalIgnoreCase))
+                rank += 1;
+            return rank;
         }
 
         public static string FfmpegHeaders()
@@ -158,6 +185,23 @@ namespace M3U8_Downloader
                 return host + baseUrl + ToString(urlInfo, "extra");
             }
             return null;
+        }
+
+        static string ExpandShareUrl(string url)
+        {
+            var request = (HttpWebRequest)WebRequest.Create(url);
+            request.Method = "GET";
+            request.UserAgent = UserAgent;
+            request.AllowAutoRedirect = false;
+            request.Timeout = 15000;
+            request.ReadWriteTimeout = 15000;
+            using (var response = (HttpWebResponse)request.GetResponse())
+            {
+                string location = response.Headers["Location"];
+                if (string.IsNullOrEmpty(location))
+                    return url;
+                return new Uri(new Uri(url), location).GetLeftPart(UriPartial.Path);
+            }
         }
 
         static string HttpGet(string url)
