@@ -18,7 +18,7 @@ jobs:
         run: nuget restore "M3U8 Downloader.sln"
 
       - name: Build Release
-        run: msbuild "M3U8 Downloader.sln" /p:Configuration=Release /p:Platform=x86 /v:m
+        run: msbuild "M3U8 Downloader.sln" /p:Configuration=Release /p:Platform=x86 /p:TargetFrameworkVersion=v4.8 /v:m
 
       - name: Stage ffmpeg
         shell: pwsh
