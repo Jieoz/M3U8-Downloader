@@ -21,7 +21,7 @@ namespace M3U8_Downloader
         public const string Referer = "https://live.bilibili.com/";
 
         static readonly Regex RoomUrl = new Regex(
-            @"^https?://live\.bilibili\.com/(?:blanc/|h5/)?(?<id>\d+)/?(?:[?#].*)?$",
+            @"https?://live\.bilibili\.com/(?:blanc/|h5/)?(?<id>\d+)",
             RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
         static readonly Regex ShareUrl = new Regex(

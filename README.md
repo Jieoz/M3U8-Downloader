@@ -4,7 +4,7 @@ Fork of [magicdmer/M3U8-Downloader](https://github.com/magicdmer/M3U8-Downloader
 
 ## 现在还适不适合用
 
-原程序只做一件事：把你已经拿到的 m3u8 地址交给 `Tools\ffmpeg.exe`，`-c copy` 合成 mp4。它不解析网页，也不带站点请求头。本 fork 当前版本 2.2.0。
+原程序只做一件事：把你已经拿到的 m3u8 地址交给 `Tools\ffmpeg.exe`，`-c copy` 合成 mp4。它不解析网页，也不带站点请求头。本 fork 当前版本 2.2.1。
 
 仍然适用：
 
@@ -24,13 +24,13 @@ Fork of [magicdmer/M3U8-Downloader](https://github.com/magicdmer/M3U8-Downloader
 
 地址框可填：
 
-- `https://live.bilibili.com/5050`
+- `https://live.bilibili.com/24624923?live_from=71002`
 - `5050`
 - 整行分享文案，例如 `【标题-哔哩哔哩直播】 https://b23.tv/wD77dU1`
 
 短链会先跳到 `live.bilibili.com/<房间号>`，再取当前最高清晰度的 HLS。同清晰度优先 AVC + TS，兼容原来的 ffmpeg copy。
 
-保存名照旧。直播没有总时长，进度条会失真；停录用原来的停止按钮，不自动限时。
+保存目录在菜单「设置」里，选好路径点确定，会写进程序目录的 `M3u8_Downloader_Settings.xml`。主界面没有单独的路径框。不改的话，默认存到程序所在目录。文件名用主界面的保存名。直播没有总时长，进度条会失真；停录用原来的停止按钮，不自动限时。
 
 普通 m3u8 地址行为不变。
 
