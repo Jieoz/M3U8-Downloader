@@ -105,7 +105,10 @@ namespace M3U8_Downloader
             var sizekb = size.Matches(textBox_forRegex.Text);
 
             Regex duration = new Regex(@"Duration: (\d\d[.:]){3}\d\d", RegexOptions.Compiled | RegexOptions.Singleline);//取总视频时长
-            string label5 = "[总时长：" + duration.Match(m_outPut).Value.Replace("Duration: ", "") + "]";
+            bool hasDuration = duration.IsMatch(m_outPut);
+            string label5 = hasDuration
+                ? "[总时长：" + duration.Match(m_outPut).Value.Replace("Duration: ", "") + "]"
+                : "[直播：无总时长]";
 
             string label6 = "[已下载：，]";
             if (time.Count > 0 && sizekb.Count > 0)
@@ -121,25 +124,34 @@ namespace M3U8_Downloader
             {
                 try
                 {
-                    Double All = Convert.ToDouble(Convert.ToDouble(label5.Substring(5, 2)) * 60 * 60 + Convert.ToDouble(label5.Substring(8, 2)) * 60
-                    + Convert.ToDouble(label5.Substring(11, 2)) + Convert.ToDouble(label5.Substring(14, 2)) / 100);
-                    Double Downloaded = Convert.ToDouble(Convert.ToDouble(label6.Substring(5, 2)) * 60 * 60 + Convert.ToDouble(label6.Substring(8, 2)) * 60
-                    + Convert.ToDouble(label6.Substring(11, 2)) + Convert.ToDouble(label6.Substring(14, 2)) / 100);
+                    if (hasDuration)
+                    {
+                        ProgressBar.Style = ProgressBarStyle.Continuous;
+                        Double All = Convert.ToDouble(Convert.ToDouble(label5.Substring(5, 2)) * 60 * 60 + Convert.ToDouble(label5.Substring(8, 2)) * 60
+                        + Convert.ToDouble(label5.Substring(11, 2)) + Convert.ToDouble(label5.Substring(14, 2)) / 100);
+                        Double Downloaded = Convert.ToDouble(Convert.ToDouble(label6.Substring(5, 2)) * 60 * 60 + Convert.ToDouble(label6.Substring(8, 2)) * 60
+                        + Convert.ToDouble(label6.Substring(11, 2)) + Convert.ToDouble(label6.Substring(14, 2)) / 100);
 
-                    if (All == 0) All = 1;  //防止被除数为零导致程序崩溃
-                    Double Progress = (Downloaded / All) * 100;
+                        if (All == 0) All = 1;  //防止被除数为零导致程序崩溃
+                        Double Progress = (Downloaded / All) * 100;
 
-                    if (Progress > 100)  //防止进度条超过百分之百
-                        Progress = 100;
-                    if (Progress < 0)  //防止进度条小于零……
-                        Progress = 0;
+                        if (Progress > 100)  //防止进度条超过百分之百
+                            Progress = 100;
+                        if (Progress < 0)  //防止进度条小于零……
+                            Progress = 0;
 
-                    ProgressBar.Value = Convert.ToInt32(Progress);
-                    windowsTaskbar.SetProgressValue(Convert.ToInt32(Progress), 100, this.Handle);
-                    Application.DoEvents();
-                    
-                    this.Text = "[" + m_count.ToString() + " / " + m_urlList.Length.ToString() + "]" + "已完成：" +
-                        String.Format("{0:F}", Progress) + "%";
+                        ProgressBar.Value = Convert.ToInt32(Progress);
+                        windowsTaskbar.SetProgressValue(Convert.ToInt32(Progress), 100, this.Handle);
+                        Application.DoEvents();
+
+                        this.Text = "[" + m_count.ToString() + " / " + m_urlList.Length.ToString() + "]" + "已完成：" +
+                            String.Format("{0:F}", Progress) + "%";
+                    }
+                    else
+                    {
+                        ProgressBar.Style = ProgressBarStyle.Marquee;
+                        this.Text = "[" + m_count.ToString() + " / " + m_urlList.Length.ToString() + "] " + label6;
+                    }
                 }
                 catch (Exception)
                 {

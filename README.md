@@ -4,7 +4,7 @@ Fork of [magicdmer/M3U8-Downloader](https://github.com/magicdmer/M3U8-Downloader
 
 ## 现在还适不适合用
 
-原程序只做一件事：把你已经拿到的 m3u8 地址交给 `Tools\ffmpeg.exe`，`-c copy` 合成 mp4。它不解析网页，也不带站点请求头。本 fork 当前版本 2.2.1。
+原程序只做一件事：把你已经拿到的 m3u8 地址交给 `Tools\ffmpeg.exe`，`-c copy` 合成 mp4。它不解析网页，也不带站点请求头。本 fork 当前版本 2.2.2。
 
 仍然适用：
 
@@ -28,9 +28,11 @@ Fork of [magicdmer/M3U8-Downloader](https://github.com/magicdmer/M3U8-Downloader
 - `5050`
 - 整行分享文案，例如 `【标题-哔哩哔哩直播】 https://b23.tv/wD77dU1`
 
-短链会先跳到 `live.bilibili.com/<房间号>`，再取当前最高清晰度的 HLS。同清晰度优先 AVC + TS，兼容原来的 ffmpeg copy。
+短链会先跳到 `live.bilibili.com/<房间号>`。优先取最高清晰度的 HLS（AVC + TS）。这份地址连不上时，改用同清晰度的 FLV。直播录制不再套 `aac_adtstoasc`，否则封装出的 AAC 会变成几 kb/s、几乎无声。
 
-保存目录在菜单「设置」里，选好路径点确定，会写进程序目录的 `M3u8_Downloader_Settings.xml`。主界面没有单独的路径框。不改的话，默认存到程序所在目录。文件名用主界面的保存名。直播没有总时长，进度条会失真；停录用原来的停止按钮，不自动限时。
+直播没有总时长，标题不再显示百分比，改显示已录时间和大小，进度条走马灯。点播 m3u8 仍按总时长显示百分比。停录用原来的停止按钮。
+
+保存目录在菜单「设置」里，选好路径点确定，会写进程序目录的 `M3u8_Downloader_Settings.xml`。主界面没有单独的路径框。不改的话，默认存到程序所在目录。文件名用主界面的保存名。
 
 普通 m3u8 地址行为不变。
 

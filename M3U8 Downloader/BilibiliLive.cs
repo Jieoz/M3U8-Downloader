@@ -131,6 +131,39 @@ namespace M3U8_Downloader
                     }
                 }
             }
+            if (fallback == null)
+            {
+                foreach (object streamObj in streams)
+                {
+                    var stream = streamObj as Dictionary<string, object>;
+                    if (stream == null || !string.Equals(ToString(stream, "protocol_name"), "http_stream", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    foreach (object formatObj in AsList(stream, "format"))
+                    {
+                        var format = formatObj as Dictionary<string, object>;
+                        if (format == null || !string.Equals(ToString(format, "format_name"), "flv", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        foreach (object codecObj in AsList(format, "codec"))
+                        {
+                            var codec = codecObj as Dictionary<string, object>;
+                            if (codec == null)
+                                continue;
+                            string url = JoinUrl(codec);
+                            if (string.IsNullOrEmpty(url))
+                                continue;
+                            var candidate = new LiveStream
+                            {
+                                Url = url,
+                                FormatName = "flv",
+                                CodecName = ToString(codec, "codec_name"),
+                                Quality = ToInt(codec, "current_qn", 0)
+                            };
+                            if (Better(candidate, fallback))
+                                fallback = candidate;
+                        }
+                    }
+                }
+            }
             return fallback;
         }
 
@@ -166,7 +199,7 @@ namespace M3U8_Downloader
             command.Append("-hide_banner -rw_timeout 15000000 -user_agent ").Append(Quote(UserAgent));
             command.Append(" -headers ").Append(Quote(FfmpegHeaders()));
             command.Append(" -i ").Append(Quote(inputUrl));
-            command.Append(" -c copy -y -bsf:a aac_adtstoasc -movflags +faststart ");
+            command.Append(" -c copy -y -movflags +faststart ");
             command.Append(Quote(outputPath));
             return command.ToString();
         }
