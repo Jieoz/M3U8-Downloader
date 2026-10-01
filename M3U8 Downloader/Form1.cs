@@ -17,7 +17,7 @@ namespace M3U8_Downloader
 {
     public partial class Form1 : Form
     {
-        public const string AppVersion = "2.4.0";
+        public const string AppVersion = "2.5.0";
         const string ReleasesUrl = "https://github.com/Jieoz/M3U8-Downloader/releases";
 
         [DllImport("user32.dll")]
@@ -34,6 +34,7 @@ namespace M3U8_Downloader
         // 代码里加的控件（设计器里只有旧的单任务界面）
         ListView listTasks;
         Button button_Clear;
+        Button button_Retry;
         Label label_Parallel;
         NumericUpDown numParallel;
         ContextMenuStrip taskMenu;
@@ -106,7 +107,7 @@ namespace M3U8_Downloader
             taskMenu = new ContextMenuStrip();
             cmStop = new ToolStripMenuItem("停止", null, (s, e) => ForSelected(manager.Stop));
             cmKill = new ToolStripMenuItem("强制停止", null, (s, e) => ForSelected(manager.Kill));
-            cmRetry = new ToolStripMenuItem("重新下载", null, (s, e) => ForSelected(manager.Retry));
+            cmRetry = new ToolStripMenuItem("重新开始", null, (s, e) => ForSelected(manager.Retry));
             cmOpenFile = new ToolStripMenuItem("播放文件", null, (s, e) => OpenSelectedFile());
             cmOpenFolder = new ToolStripMenuItem("打开所在位置", null, (s, e) => RevealSelected());
             cmCopy = new ToolStripMenuItem("复制地址和错误", null, (s, e) => CopySelected());
@@ -117,6 +118,15 @@ namespace M3U8_Downloader
 
             button_Clear = new Button { UseVisualStyleBackColor = true };
             button_Clear.Click += (s, e) => manager.ClearEnded();
+            // 停止后不用右键也能接着录 / 重下
+            button_Retry = new Button { UseVisualStyleBackColor = true };
+            button_Retry.Click += (s, e) =>
+            {
+                if (listTasks.SelectedItems.Count > 0)
+                    ForSelected(manager.Retry);
+                else
+                    manager.RetryAllEnded();
+            };
 
             label_Parallel = new Label { AutoSize = true };
             numParallel = new NumericUpDown { Minimum = 1, Maximum = 8, Value = 3 };
@@ -124,6 +134,7 @@ namespace M3U8_Downloader
 
             Controls.Add(listTasks);
             Controls.Add(button_Clear);
+            Controls.Add(button_Retry);
             Controls.Add(label_Parallel);
             Controls.Add(numParallel);
 
@@ -173,8 +184,9 @@ namespace M3U8_Downloader
             numParallel.Location = new Point(S(420), S(172));
             numParallel.Size = new Size(S(56), S(23));
 
-            int by = S(206), bw = S(112), bh = S(34), gap = S(8);
-            Button[] buttons = { button_Download, button_Stop, button_ForceStop, button_Clear, button_OpenFolder };
+            int by = S(206), bh = S(34), gap = S(8);
+            Button[] buttons = { button_Download, button_Stop, button_ForceStop, button_Retry, button_Clear, button_OpenFolder };
+            int bw = (inner - gap * (buttons.Length - 1)) / buttons.Length;
             for (int i = 0; i < buttons.Length; i++)
             {
                 buttons[i].Location = new Point(pad + i * (bw + gap), by);
@@ -215,6 +227,9 @@ namespace M3U8_Downloader
                 listTasks.Columns[i].Text = cols[i];
             toolTip1.SetToolTip(button_Stop, en ? "Ask ffmpeg to finish the file (selected tasks, or all)" : "让 ffmpeg 收尾后停止（选中的任务；没选就是全部）");
             toolTip1.SetToolTip(button_ForceStop, en ? "Kill ffmpeg now; the part already written still plays" : "立即结束 ffmpeg；已下载的部分仍可播放");
+            toolTip1.SetToolTip(button_Retry, en
+                ? "Live: watch the room again and record a new file. VOD: download again to a new file."
+                : "没选中时作用于全部已结束的任务（完成的点播除外）。直播：接着盯房间，开播录新文件；点播：重新下载到新文件，不覆盖");
             toolTip1.SetToolTip(numParallel, en ? "VOD only; extra addresses wait in the queue. Live rooms never queue." : "只限点播，超过的排队；直播间不占名额、开播就录");
             UpdateButtons();
             UpdateSummary();
@@ -228,6 +243,10 @@ namespace M3U8_Downloader
             bool sel = listTasks.SelectedItems.Count > 0;
             button_Stop.Text = sel ? (en ? "Stop selected" : "停止选中") : (en ? "Stop all" : "全部停止");
             button_ForceStop.Text = sel ? (en ? "Kill selected" : "强制停止选中") : (en ? "Kill all" : "全部强制停止");
+            // 6 个按钮挤一行，「全部重新开始」在常见字体下会被截掉；没选中时用「重新开始」，提示里说明作用于全部
+            button_Retry.Text = sel ? (en ? "Restart sel." : "重开选中") : (en ? "Restart" : "重新开始");
+            var tasks = sel ? SelectedTasks() : manager.Tasks.Where(t => !(t.State == TaskState.Completed && !t.IsLive)).ToList();
+            button_Retry.Enabled = tasks.Any(t => t.IsEnded);
         }
 
         // ---------------- 任务列表 ----------------
@@ -259,6 +278,7 @@ namespace M3U8_Downloader
             ListViewItem item;
             if (rows.TryGetValue(task, out item))
                 FillRow(item, task);
+            UpdateButtons();
             UpdateSummary();
         }
 
@@ -286,7 +306,8 @@ namespace M3U8_Downloader
             if (!task.IsLive)
                 return task.Info.Length > 0 ? task.Info : task.Source;
             var parts = new List<string>();
-            parts.Add((en ? "Room " : "房间 ") + (task.RoomId.Length > 0 ? task.RoomId : task.Source));
+            string site = task.Site == LiveSite.Douyin ? (en ? "Douyin " : "抖音 ") : (en ? "Bilibili " : "B站 ");
+            parts.Add(site + (en ? "room " : "房间 ") + (task.RoomId.Length > 0 ? task.RoomId : task.Source));
             if (task.Sessions > 0)
                 parts.Add(en ? task.Sessions + " recorded" : "已录 " + task.Sessions + " 场");
             if (task.State == TaskState.Running || task.State == TaskState.Stopping)
@@ -430,7 +451,7 @@ namespace M3U8_Downloader
             bool en = CurrentLanguage == "en";
             cmStop.Text = en ? "Stop" : "停止";
             cmKill.Text = en ? "Kill" : "强制停止";
-            cmRetry.Text = en ? "Download again" : "重新下载";
+            cmRetry.Text = en ? "Restart" : "重新开始";
             cmOpenFile.Text = en ? "Play file" : "播放文件";
             cmOpenFolder.Text = en ? "Show in folder" : "打开所在位置";
             cmCopy.Text = en ? "Copy address and error" : "复制地址和错误";
@@ -716,7 +737,7 @@ namespace M3U8_Downloader
             var culture = new CultureInfo(languageCode);
             foreach (Control c in this.Controls)
             {
-                if (c == listTasks || c == button_Clear || c == label_Parallel || c == numParallel)
+                if (c == listTasks || c == button_Clear || c == button_Retry || c == label_Parallel || c == numParallel)
                     continue;
                 resources.ApplyResources(c, c.Name, culture);
                 if (c is MenuStrip)

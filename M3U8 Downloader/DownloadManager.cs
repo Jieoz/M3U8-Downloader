@@ -16,6 +16,7 @@ namespace M3U8_Downloader
         Waiting,    // 直播间没开播，定时再查
         Running,    // ffmpeg 运行中
         Stopping,   // 已发 q，等待收尾
+        Finalizing, // ffmpeg 已退出，正在把分片 MP4 整理成普通 MP4（时长、拖动才正常）
         Completed,  // 正常下完
         Stopped,    // 用户停止（文件可播）
         Killed,     // 用户强制停止（分片 MP4，已写入部分可播）
@@ -30,7 +31,8 @@ namespace M3U8_Downloader
         public string BaseName;        // 点播：前缀 + 行号，例如 Video0；直播启动时按主播名生成
         public string OutputPath;      // 启动时才分配，保证不覆盖；排队时为 null。直播是最近一场的文件
         public TaskState State = TaskState.Queued;
-        public bool IsLive;
+        public LiveSite Site;           // None = 点播
+        public bool IsLive { get { return Site != LiveSite.None; } }
         public double DurationSec = -1; // -1 = 未知（直播）
         public double DoneSec;
         public long SizeBytes;
@@ -56,6 +58,7 @@ namespace M3U8_Downloader
         internal Timer WatchTimer;
         internal int WatchGen;          // 每次停止 / 重新计时 +1，过期的定时器回调直接丢掉
         internal DateTime SessionStart;
+        internal Process FixProc;       // 整理文件用的 ffmpeg
 
         public string FileName
         {
@@ -71,7 +74,7 @@ namespace M3U8_Downloader
 
         public bool IsActive
         {
-            get { return State == TaskState.Resolving || State == TaskState.Running || State == TaskState.Stopping; }
+            get { return State == TaskState.Resolving || State == TaskState.Running || State == TaskState.Stopping || State == TaskState.Finalizing; }
         }
 
         public bool IsEnded
@@ -128,7 +131,7 @@ namespace M3U8_Downloader
         public DownloadManager(Action<Action> post)
         {
             this.post = post;
-            BilibiliLive.Proxy = () => Proxy();
+            LiveCommon.Proxy = () => Proxy();
         }
 
         public IList<DownloadTask> Tasks { get { return tasks.AsReadOnly(); } }
@@ -154,7 +157,7 @@ namespace M3U8_Downloader
                 string line = raw.Trim();
                 if (line.Length == 0)
                     continue;
-                var task = new DownloadTask { Id = nextId++, Source = line, IsLive = BilibiliLive.LooksLikeLive(line) };
+                var task = new DownloadTask { Id = nextId++, Source = line, Site = LiveCommon.Detect(line) };
                 if (!task.IsLive)
                     task.BaseName = prefix + (vodIndex++).ToString(CultureInfo.InvariantCulture);
                 tasks.Add(task);
@@ -167,22 +170,33 @@ namespace M3U8_Downloader
             return added;
         }
 
+        /// <summary>
+        /// 已结束的任务原地重新开始（同一行）：直播接着盯房间、开播就录新文件，已录场数保留；
+        /// 点播重新下载到新文件名，不覆盖上次的文件。
+        /// </summary>
         public void Retry(DownloadTask task)
         {
             if (!task.IsEnded)
                 return;
-            var copy = new DownloadTask { Id = nextId++, Source = task.Source, BaseName = task.BaseName, IsLive = task.IsLive };
-            if (copy.IsLive)
+            task.StopRequested = false;
+            task.KillRequested = false;
+            task.Error = "";
+            task.Note = "";
+            task.DoneSec = 0;
+            task.DurationSec = -1;
+            task.ProgressTime = null;
+            task.ProgressSize = -1;
+            lock (task.Tail) task.Tail.Clear();
+            if (task.IsLive)
             {
-                copy.BaseName = null;
-                copy.RoomId = task.RoomId;
-                copy.Anchor = task.Anchor;
-                copy.AnchorLoaded = task.AnchorLoaded;
+                StartWatch(task, 0);
+                return;
             }
-            tasks.Add(copy);
-            Raise(TaskAdded, copy);
-            if (copy.IsLive)
-                StartWatch(copy, 0);
+            task.OutputPath = null;
+            task.SizeBytes = 0;
+            task.Info = "";
+            task.State = TaskState.Queued;
+            Raise(TaskChanged, task);
             Pump();
         }
 
@@ -196,6 +210,13 @@ namespace M3U8_Downloader
             Raise(TaskRemoved, task);
             if (task.State == TaskState.Queued)
                 CheckIdle(true);
+        }
+
+        /// <summary>没选中时「全部重新开始」：已停止 / 强制停止 / 失败 / 取消的；完成的点播不重下。</summary>
+        public void RetryAllEnded()
+        {
+            foreach (var t in tasks.FindAll(x => x.IsEnded && !(x.State == TaskState.Completed && !x.IsLive)))
+                Retry(t);
         }
 
         public void ClearEnded()
@@ -249,6 +270,14 @@ namespace M3U8_Downloader
                 Stop(task);
                 return;
             }
+            if (task.State == TaskState.Finalizing)
+            {
+                // 不等整理了：保留原文件（能播，只是时长显示不对）
+                task.KillRequested = true;
+                if (task.FixProc != null)
+                    try { task.FixProc.Kill(); } catch { }
+                return;
+            }
             if (task.State != TaskState.Running && task.State != TaskState.Stopping)
                 return;
             task.KillRequested = true;
@@ -268,7 +297,7 @@ namespace M3U8_Downloader
         {
             foreach (var t in tasks.FindAll(x => x.State == TaskState.Queued || x.State == TaskState.Resolving || x.State == TaskState.Waiting))
                 Stop(t);
-            foreach (var t in tasks.FindAll(x => x.State == TaskState.Running || x.State == TaskState.Stopping))
+            foreach (var t in tasks.FindAll(x => x.State == TaskState.Running || x.State == TaskState.Stopping || x.State == TaskState.Finalizing))
                 Kill(t);
         }
 
@@ -281,6 +310,9 @@ namespace M3U8_Downloader
                 t.StopRequested = true;
                 t.State = TaskState.Cancelled;
             }
+            // 正在整理的直接停掉：原文件还在，只是时长显示不对
+            foreach (var t in tasks.FindAll(x => x.FixProc != null))
+                try { t.FixProc.Kill(); } catch { }
             var running = tasks.FindAll(x => x.Proc != null && (x.State == TaskState.Running || x.State == TaskState.Stopping));
             foreach (var t in running)
             {
@@ -393,6 +425,7 @@ namespace M3U8_Downloader
             task.StopRequested = false;
             Raise(TaskChanged, task);
             string source = task.Source, knownRoom = task.RoomId;
+            LiveSite site = task.Site;
             bool needAnchor = !task.AnchorLoaded;
             ThreadPool.QueueUserWorkItem(_ =>
             {
@@ -401,11 +434,10 @@ namespace M3U8_Downloader
                 bool permanent = false;
                 try
                 {
-                    string roomId = knownRoom;
-                    if (string.IsNullOrEmpty(roomId) && !BilibiliLive.TryParseRoomId(source, out roomId))
-                        throw new LiveRoomException("认不出直播间地址", true);
-                    status = BilibiliLive.Check(roomId);
-                    if (needAnchor)
+                    status = LiveCommon.Check(site, source, knownRoom);
+                    if (status.Anchor.Length > 0)
+                        anchor = status.Anchor;   // 抖音接口顺带给了
+                    else if (needAnchor && site == LiveSite.Bilibili)
                         anchor = BilibiliLive.GetAnchorName(status.RoomId);
                 }
                 catch (LiveRoomException ex)
@@ -473,9 +505,9 @@ namespace M3U8_Downloader
             task.ProgressSize = -1;
             lock (task.Tail) task.Tail.Clear();
             LiveStream stream = task.Lines[task.LineIndex];
-            task.Info = stream.FormatName + "/" + stream.CodecName + " qn=" + stream.Quality
+            task.Info = stream.FormatName + "/" + stream.CodecName + " " + stream.QualityName
                 + (task.Lines.Count > 1 ? " 线路 " + (task.LineIndex + 1) + "/" + task.Lines.Count : "");
-            Launch(task, BilibiliLive.BuildRecordCommand(stream, task.OutputPath, Proxy()), null);
+            Launch(task, LiveCommon.BuildRecordCommand(stream, task.OutputPath, Proxy()), null);
         }
 
         void Wait(DownloadTask task, int delayMs)
@@ -487,7 +519,7 @@ namespace M3U8_Downloader
             CheckIdle(false);
         }
 
-        /// <summary>主播名_房间号_yyyyMMdd-HHmm；查不到主播名就只用房间号。</summary>
+        /// <summary>主播名_房间号_yyyyMMdd-HHmm（抖音是直播间号）；查不到主播名就只用房间号。</summary>
         public static string LiveBaseName(string anchor, string roomId, DateTime start)
         {
             string time = start.ToString("yyyyMMdd-HHmm", CultureInfo.InvariantCulture);
@@ -531,10 +563,10 @@ namespace M3U8_Downloader
         {
             var sb = new StringBuilder();
             if (!string.IsNullOrWhiteSpace(proxy))
-                sb.Append("-http_proxy ").Append(BilibiliLive.Quote(proxy.Trim())).Append(' ');
-            sb.Append("-rw_timeout 10000000 -i ").Append(BilibiliLive.Quote(input));
+                sb.Append("-http_proxy ").Append(LiveCommon.Quote(proxy.Trim())).Append(' ');
+            sb.Append("-rw_timeout 10000000 -i ").Append(LiveCommon.Quote(input));
             sb.Append(" -c copy -bsf:a aac_adtstoasc ").Append(Mp4Flags).Append(' ');
-            sb.Append(BilibiliLive.Quote(output));
+            sb.Append(LiveCommon.Quote(output));
             return sb.ToString();
         }
 
@@ -680,8 +712,20 @@ namespace M3U8_Downloader
                 code = task.Proc.ExitCode;
             }
             catch { }
+            try { task.Proc.Dispose(); } catch { }
+            task.Proc = null;
             try { task.SizeBytes = new FileInfo(task.OutputPath).Length; } catch { }
+            if (task.SizeBytes > 0)
+                FixFile(task, () => AfterExit(task, code));
+            else
+                AfterExit(task, code);
+        }
 
+        void AfterExit(DownloadTask task, int code)
+        {
+            // 手动停掉的直播这场也算录过（重新开始后场数接着累计）
+            if (task.IsLive && (task.KillRequested || task.StopRequested) && task.SizeBytes > 0)
+                task.Sessions++;
             if (task.KillRequested)
                 Finish(task, TaskState.Killed, null);
             else if (task.StopRequested)
@@ -692,6 +736,71 @@ namespace M3U8_Downloader
                 Finish(task, TaskState.Completed, null);
             else
                 Finish(task, TaskState.Failed, LastError(task, code));
+        }
+
+        // 分片 MP4 的头里只记了第一个分片的时长（直播约 2~4 秒），播放器显示的总时长、
+        // 进度条拖动都按这个来，虽然整段能播。录完把它原样转封装成普通 MP4（不重新编码，
+        // 只读写一遍文件）。整理失败就保留原文件，照样能播。
+        void FixFile(DownloadTask task, Action done)
+        {
+            string src = task.OutputPath;
+            string tmp = src + ".fix.mp4";
+            task.State = TaskState.Finalizing;
+            Raise(TaskChanged, task);
+            var p = new Process();
+            p.StartInfo.FileName = FfmpegPath;
+            p.StartInfo.Arguments = "-hide_banner -loglevel error -y -i " + LiveCommon.Quote(src)
+                + " -map 0:v? -map 0:a? -c copy " + LiveCommon.Quote(tmp);
+            p.StartInfo.CreateNoWindow = true;
+            p.StartInfo.UseShellExecute = false;
+            p.StartInfo.RedirectStandardInput = true;
+            p.StartInfo.RedirectStandardOutput = true;
+            p.StartInfo.RedirectStandardError = true;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string note = null;
+                try
+                {
+                    p.Start();
+                    post(() => task.FixProc = p);
+                    p.StandardOutput.ReadToEndAsync();
+                    string err = p.StandardError.ReadToEnd();
+                    p.WaitForExit();
+                    long srcLen = new FileInfo(src).Length;
+                    long tmpLen = File.Exists(tmp) ? new FileInfo(tmp).Length : 0;
+                    // 转封装几乎不改变大小；明显变小说明没读全，不替换
+                    if (p.ExitCode == 0 && tmpLen > srcLen / 2)
+                    {
+                        File.Delete(src);
+                        File.Move(tmp, src);
+                    }
+                    else
+                        note = "整理文件失败，保留原文件（可播放，时长显示可能不对）" + (err.Trim().Length > 0 ? "：" + LastLine(err) : "");
+                }
+                catch (Exception ex)
+                {
+                    note = "整理文件失败，保留原文件：" + ex.Message;
+                }
+                finally
+                {
+                    try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                    try { p.Dispose(); } catch { }
+                }
+                post(() =>
+                {
+                    task.FixProc = null;
+                    try { task.SizeBytes = new FileInfo(src).Length; } catch { }
+                    if (note != null)
+                        task.Note = note;
+                    done();
+                });
+            });
+        }
+
+        static string LastLine(string text)
+        {
+            string[] lines = text.Trim().Split('\n');
+            return lines[lines.Length - 1].Trim();
         }
 
         static string LastError(DownloadTask task, int code)
@@ -762,6 +871,7 @@ namespace M3U8_Downloader
                 case TaskState.Waiting: return "等待开播";
                 case TaskState.Running: return "下载中";
                 case TaskState.Stopping: return "正在停止";
+                case TaskState.Finalizing: return "整理文件";
                 case TaskState.Completed: return "完成";
                 case TaskState.Stopped: return "已停止";
                 case TaskState.Killed: return "已强制停止";
