@@ -17,7 +17,7 @@ namespace M3U8_Downloader
 {
     public partial class Form1 : Form
     {
-        public const string AppVersion = "2.5.0";
+        public const string AppVersion = "2.6.0";
         const string ReleasesUrl = "https://github.com/Jieoz/M3U8-Downloader/releases";
 
         [DllImport("user32.dll")]
@@ -38,6 +38,7 @@ namespace M3U8_Downloader
         Label label_Parallel;
         NumericUpDown numParallel;
         ContextMenuStrip taskMenu;
+        ToolStripMenuItem menu_Plugin;
         ToolStripMenuItem cmStop, cmKill, cmRetry, cmOpenFile, cmOpenFolder, cmCopy, cmRemove;
 
         const int ColProgress = 3;
@@ -132,6 +133,10 @@ namespace M3U8_Downloader
             numParallel = new NumericUpDown { Minimum = 1, Maximum = 8, Value = 3 };
             numParallel.ValueChanged += (s, e) => manager.MaxParallel = (int)numParallel.Value;
 
+            // 工具 → Streamlink 插件（录 B 站、抖音以外的直播间）
+            menu_Plugin = new ToolStripMenuItem("Streamlink 插件…", null, (s, e) => ShowPluginDialog());
+            工具TToolStripMenuItem.DropDownItems.Add(menu_Plugin);
+
             Controls.Add(listTasks);
             Controls.Add(button_Clear);
             Controls.Add(button_Retry);
@@ -217,6 +222,7 @@ namespace M3U8_Downloader
             label1.Text = en ? "Addresses (one per line, downloaded in parallel)" : "下载地址（每行一个，可同时下载多个）";
             label2.Text = en ? "VOD name prefix (Video0.mp4 ...; live: anchor_room_time.mp4)" : "点播文件名前缀（Video0.mp4…；直播按 主播_房间号_时间 命名）";
             label_Parallel.Text = en ? "Parallel:" : "同时下载：";
+            menu_Plugin.Text = en ? "Streamlink plugin..." : "Streamlink 插件…";
             button_Download.Text = en ? "Start" : "开始下载";
             button_Clear.Text = en ? "Clear ended" : "清除已结束";
             button_OpenFolder.Text = en ? "Open folder" : "打开目录";
@@ -306,7 +312,9 @@ namespace M3U8_Downloader
             if (!task.IsLive)
                 return task.Info.Length > 0 ? task.Info : task.Source;
             var parts = new List<string>();
-            string site = task.Site == LiveSite.Douyin ? (en ? "Douyin " : "抖音 ") : (en ? "Bilibili " : "B站 ");
+            string site = task.Site == LiveSite.Douyin ? (en ? "Douyin " : "抖音 ")
+                : task.Site == LiveSite.Streamlink ? StreamlinkPlugin.SiteLabel(task.SiteName) + " "
+                : (en ? "Bilibili " : "B站 ");
             parts.Add(site + (en ? "room " : "房间 ") + (task.RoomId.Length > 0 ? task.RoomId : task.Source));
             if (task.Sessions > 0)
                 parts.Add(en ? task.Sessions + " recorded" : "已录 " + task.Sessions + " 场");
@@ -613,6 +621,9 @@ namespace M3U8_Downloader
                     m_path = doc.SelectSingleNode("//DownPath").InnerText;
                     m_proxy = doc.SelectSingleNode("//HttpProxy").InnerText;
                     menu_Proxy.CheckState = doc.SelectSingleNode("//EnableProxy").InnerText.Trim() == "1" ? CheckState.Checked : CheckState.Unchecked;
+                    XmlNode sl = doc.SelectSingleNode("//StreamlinkPath");
+                    if (sl != null)
+                        StreamlinkPlugin.ConfiguredPath = sl.InnerText.Trim();
                     XmlNode par = doc.SelectSingleNode("//MaxParallel");
                     int n;
                     if (par != null && int.TryParse(par.InnerText, out n))
@@ -654,6 +665,13 @@ namespace M3U8_Downloader
                     doc.DocumentElement.AppendChild(par);
                 }
                 par.InnerText = ((int)numParallel.Value).ToString();
+                XmlNode sl = doc.SelectSingleNode("//StreamlinkPath");
+                if (sl == null)
+                {
+                    sl = doc.CreateElement("StreamlinkPath");
+                    doc.DocumentElement.AppendChild(sl);
+                }
+                sl.InnerText = StreamlinkPlugin.ConfiguredPath ?? "";
                 doc.Save(SettingsPath);
             }
             catch { }
@@ -693,6 +711,16 @@ namespace M3U8_Downloader
                 return;
             }
             menu_Proxy.CheckState = menu_Proxy.CheckState == CheckState.Unchecked ? CheckState.Checked : CheckState.Unchecked;
+        }
+
+        void ShowPluginDialog()
+        {
+            using (var dlg = new PluginForm(CurrentLanguage == "en"))
+            {
+                dlg.ShowDialog(this);
+                StreamlinkPlugin.ConfiguredPath = dlg.ChosenPath;
+            }
+            SaveSettingsOnExit();
         }
 
         private void menu_About_Click(object sender, EventArgs e)

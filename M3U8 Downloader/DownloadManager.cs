@@ -24,6 +24,14 @@ namespace M3U8_Downloader
         Cancelled   // 排队时被取消，从未启动
     }
 
+    /// <summary>同一批地址的点播文件名序号：Video0、Video1…</summary>
+    public sealed class VodCounter
+    {
+        public string Prefix;
+        int next;
+        public string Take() { return Prefix + (next++).ToString(CultureInfo.InvariantCulture); }
+    }
+
     public class DownloadTask
     {
         public int Id;
@@ -48,6 +56,8 @@ namespace M3U8_Downloader
 
         // 直播盯房间
         public string RoomId = "";      // 真实房间号
+        public string SiteName = "";    // Streamlink 插件名（huya、douyu…）
+        internal VodCounter VodNames;   // Streamlink 不认识这个网页时，从同一批的点播序号里接着取名
         public string Anchor = "";      // 主播名
         public int Sessions;            // 已录场数
         public DateTime NextCheck;      // Waiting 时下次检查的时间
@@ -151,7 +161,8 @@ namespace M3U8_Downloader
         {
             var added = new List<DownloadTask>();
             string[] lines = (text ?? "").Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
-            int vodIndex = 0, liveIndex = 0;
+            var vod = new VodCounter { Prefix = prefix };
+            int liveIndex = 0;
             foreach (string raw in lines)
             {
                 string line = raw.Trim();
@@ -159,7 +170,9 @@ namespace M3U8_Downloader
                     continue;
                 var task = new DownloadTask { Id = nextId++, Source = line, Site = LiveCommon.Detect(line) };
                 if (!task.IsLive)
-                    task.BaseName = prefix + (vodIndex++).ToString(CultureInfo.InvariantCulture);
+                    task.BaseName = vod.Take();
+                else if (task.Site == LiveSite.Streamlink)   // 插件不认识时才按点播取名，认出是直播间就不占序号
+                    task.VodNames = vod;
                 tasks.Add(task);
                 added.Add(task);
                 Raise(TaskAdded, task);
@@ -431,7 +444,7 @@ namespace M3U8_Downloader
             {
                 LiveRoomStatus status = null;
                 string anchor = null, error = null;
-                bool permanent = false;
+                bool permanent = false, unsupported = false;
                 try
                 {
                     status = LiveCommon.Check(site, source, knownRoom);
@@ -439,6 +452,11 @@ namespace M3U8_Downloader
                         anchor = status.Anchor;   // 抖音接口顺带给了
                     else if (needAnchor && site == LiveSite.Bilibili)
                         anchor = BilibiliLive.GetAnchorName(status.RoomId);
+                }
+                catch (StreamlinkUnsupportedException ex)
+                {
+                    error = ex.Message;
+                    unsupported = true;
                 }
                 catch (LiveRoomException ex)
                 {
@@ -449,8 +467,29 @@ namespace M3U8_Downloader
                 {
                     error = ex.Message;   // 网络错误：稍后再查
                 }
-                post(() => OnRoomChecked(task, status, anchor, error, permanent));
+                if (unsupported)
+                    post(() => FallBackToVod(task));
+                else
+                    post(() => OnRoomChecked(task, status, anchor, error, permanent));
             });
+        }
+
+        // Streamlink 没有这个网站的插件：不是直播间，按普通地址排队下载（和没装插件时一样）
+        void FallBackToVod(DownloadTask task)
+        {
+            if (task.State != TaskState.Resolving)
+                return;
+            if (task.StopRequested)
+            {
+                Finish(task, TaskState.Cancelled, null);
+                return;
+            }
+            task.Site = LiveSite.None;
+            task.BaseName = task.VodNames != null ? task.VodNames.Take() : "Video";
+            task.Note = "";
+            task.State = TaskState.Queued;
+            Raise(TaskChanged, task);
+            Pump();
         }
 
         void OnRoomChecked(DownloadTask task, LiveRoomStatus status, string anchor, string error, bool permanent)
@@ -463,7 +502,11 @@ namespace M3U8_Downloader
                 return;
             }
             if (status != null)
+            {
                 task.RoomId = status.RoomId;
+                if (status.Site.Length > 0)
+                    task.SiteName = status.Site;
+            }
             if (anchor != null)
             {
                 task.Anchor = anchor;
@@ -735,7 +778,15 @@ namespace M3U8_Downloader
             else if (code == 0)
                 Finish(task, TaskState.Completed, null);
             else
-                Finish(task, TaskState.Failed, LastError(task, code));
+                Finish(task, TaskState.Failed, LastError(task, code) + PluginHint(task));
+        }
+
+        // 网页地址下载失败、又没装 Streamlink：多半是别的网站的直播间，提示一下插件
+        static string PluginHint(DownloadTask task)
+        {
+            if (!StreamlinkPlugin.LooksLikePage(task.Source) || StreamlinkPlugin.Available)
+                return "";
+            return "（如果这是直播间网页：装 Streamlink 插件后可以录，见 工具 → Streamlink 插件）";
         }
 
         // 分片 MP4 的头里只记了第一个分片的时长（直播约 2~4 秒），播放器显示的总时长、

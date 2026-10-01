@@ -6,7 +6,7 @@ using System.Text;
 
 namespace M3U8_Downloader
 {
-    public enum LiveSite { None, Bilibili, Douyin }
+    public enum LiveSite { None, Bilibili, Douyin, Streamlink }
 
     /// <summary>
     /// 各直播站共用：识别是哪个站、HTTP 请求（走设置里的代理）、拼 ffmpeg 录制参数。
@@ -27,6 +27,9 @@ namespace M3U8_Downloader
                 return LiveSite.Bilibili;
             if (DouyinLive.LooksLikeLive(input))
                 return LiveSite.Douyin;
+            // 其他网页地址：装了 Streamlink 插件就先交给它认；它不认识再当普通地址下载
+            if (StreamlinkPlugin.LooksLikePage(input) && StreamlinkPlugin.Available)
+                return LiveSite.Streamlink;
             return LiveSite.None;
         }
 
@@ -34,6 +37,8 @@ namespace M3U8_Downloader
         {
             if (site == LiveSite.Douyin)
                 return DouyinLive.Check(source, knownRoom);
+            if (site == LiveSite.Streamlink)
+                return StreamlinkPlugin.Check(source, Proxy());
             string roomId = knownRoom;
             if (string.IsNullOrEmpty(roomId) && !BilibiliLive.TryParseRoomId(source, out roomId))
                 throw new LiveRoomException("认不出直播间地址", true);
@@ -122,7 +127,8 @@ namespace M3U8_Downloader
             // 断流先在 ffmpeg 里重试，尽量不把一场切成多段：HLS 单个分片失败重试 3 次；
             // 列表连续刷不出新分片默认 3 次就当结束，放宽到 20 次（约 40 秒卡顿）；
             // FLV 是单条 HTTP 长连接，用 reconnect
-            if (string.Equals(stream.FormatName, "flv", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(stream.FormatName, "flv", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(stream.FormatName, "http", StringComparison.OrdinalIgnoreCase))
                 command.Append("-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_delay_max 10 ");
             else
                 command.Append("-seg_max_retry 3 -max_reload 20 ");
@@ -130,12 +136,27 @@ namespace M3U8_Downloader
             // 用 ffmpeg 的 -referer / -user_agent，HLS 会把它们带到每个分片请求上。
             if (!string.IsNullOrEmpty(stream.Referer))
                 command.Append(" -referer ").Append(Quote(stream.Referer));
-            command.Append(" -user_agent ").Append(Quote(UserAgent));
+            string ua = UserAgent, extra = "";
+            if (stream.Headers != null)
+                foreach (var h in stream.Headers)
+                {
+                    if (h.Key.Equals("User-Agent", StringComparison.OrdinalIgnoreCase))
+                        ua = h.Value;
+                    else if (!SkipHeaders.Contains(h.Key) && h.Value.IndexOfAny(new[] { '\r', '\n', '"' }) < 0)
+                        extra += h.Key + ": " + h.Value + "\r\n";   // Origin、Cookie 之类，站点要求才有
+                }
+            command.Append(" -user_agent ").Append(Quote(ua));
+            if (extra.Length > 0)
+                command.Append(" -headers ").Append(Quote(extra));
             command.Append(" -i ").Append(Quote(stream.Url));
             command.Append(" -c copy ").Append(DownloadManager.Mp4Flags).Append(' ');
             command.Append(Quote(outputPath));
             return command.ToString();
         }
+
+        // ffmpeg 自己会带或者不该照抄的头
+        static readonly HashSet<string> SkipHeaders = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "Referer", "Accept", "Accept-Encoding", "Connection", "Host", "Content-Length" };
 
         public static string Quote(string value)
         {
@@ -195,7 +216,8 @@ namespace M3U8_Downloader
     public sealed class LiveRoomStatus
     {
         public string RoomId;      // B 站：真实（长）房间号；抖音：直播间号 web_rid（每场不变）
-        public string Anchor = ""; // 接口顺带给了主播名就填（抖音），B 站另查
+        public string Anchor = ""; // 接口顺带给了主播名就填（抖音、Streamlink），B 站另查
+        public string Site = "";   // Streamlink 的插件名（huya、douyu…）
         public bool Live;
         public List<LiveStream> Streams = new List<LiveStream>();  // Live 时才有，好的在前
     }
@@ -218,5 +240,6 @@ namespace M3U8_Downloader
         public int Quality { get; set; }
         public string QualityName { get; set; }  // 界面显示用，如 qn=10000 / 原画
         public string Referer { get; set; }
+        public Dictionary<string, string> Headers { get; set; }  // Streamlink 给的请求头（可为 null）
     }
 }

@@ -4,7 +4,7 @@ Fork of [magicdmer/M3U8-Downloader](https://github.com/magicdmer/M3U8-Downloader
 
 ## 现在还适不适合用
 
-原程序只做一件事：把你已经拿到的 m3u8 地址交给 `Tools\ffmpeg.exe`，`-c copy` 合成 mp4。它不解析网页，也不带站点请求头。本 fork 当前版本 2.5.0。
+原程序只做一件事：把你已经拿到的 m3u8 地址交给 `Tools\ffmpeg.exe`，`-c copy` 合成 mp4。它不解析网页，也不带站点请求头。本 fork 当前版本 2.6.0。
 
 仍然适用：
 
@@ -12,6 +12,7 @@ Fork of [magicdmer/M3U8-Downloader](https://github.com/magicdmer/M3U8-Downloader
 - 可选 HTTP 代理
 - 多个地址同时下载（任务列表，默认同时 3 个，其余排队）
 - B 站、抖音直播间自动盯播：没开播就等，开播自动录，下播后接着等下一场
+- 其他网站的直播间（虎牙、斗鱼、Twitch、YouTube 等）：另装 [Streamlink](https://streamlink.github.io) 当插件后同样能盯播，见下面「其他网站直播（Streamlink 插件）」
 
 已经过时、不能当通用下载器：
 
@@ -65,6 +66,25 @@ B 站、抖音部分 CDN 节点从海外直连会超时或被拒。菜单「设�
 线路按「蓝光 → 超清 → 高清 → 标清，同清晰度 FLV 优先于 HLS」排好，连不上自动换下一条。抖音 CDN 的 `http://` 地址一律换成 `https://`：走 HTTP 代理时 CDN 对 http 地址回 405。
 
 直播间不存在（status_code 4001038）直接失败；接口回空内容（cookie 失效）会换一个 cookie 重试，仍不行就下一轮再查。
+
+## 其他网站直播（Streamlink 插件）
+
+B 站、抖音以外的直播间不再逐站适配，交给 [Streamlink](https://streamlink.github.io/plugins.html)（开源、社区维护约 100 个站点插件）。软件不内置它，安装包大小不变。
+
+1. 打开 [Streamlink Windows 版下载页](https://github.com/streamlink/windows-builds/releases/latest)，下安装版（`*-x86_64.exe`）或便携版（`*-x86_64.zip`，约 80 MB）。只有 64 位版
+2. 安装版装好即可。便携版解压到本软件的 `Tools\streamlink\` 下（得到 `Tools\streamlink\bin\streamlink.exe`），或者解压到别处后在菜单「工具 → Streamlink 插件…」里用「指定 streamlink.exe」选它
+3. 「工具 → Streamlink 插件…」显示「可用：streamlink x.y.z」就装好了
+
+自动查找顺序：手动指定的路径 → `Tools\streamlink*\bin\streamlink.exe` → `Program Files\Streamlink\bin\` → `PATH`。
+
+装好后，地址框里的网页地址（不是 `.m3u8`、`.mp4`、`.flv` 这类媒体文件）先交给 Streamlink 认：
+
+- 它认出是直播间：和 B 站一样盯播。没开播显示「等待开播」，开播后由内置 ffmpeg 录，下播接着等；文件名 `主播名_房间标识_开播时间.mp4`，房间标识取地址最后一段（`huya.com/kpl` → `kpl`）
+- 线路取 Streamlink 给的 `best` 及其余清晰度从高到低，只用 ffmpeg 能直接录的 HLS / HTTP-FLV 流，连不上自动换下一条。Streamlink 给的请求头（Referer、Origin、UA 等）原样带给 ffmpeg
+- 它没有这个站的插件：按普通地址交给 ffmpeg 下载，和没装插件时一样
+- 菜单「设置」里的代理会用 `--http-proxy` 传给 Streamlink
+
+每次查房间要启动一次 Streamlink，比 B 站、抖音的原生接口慢 1～2 秒。哪个站解析失效，更新 Streamlink 即可，本软件不用改。2026-10 实测：斗鱼、虎牙可录；快手 Streamlink 没有插件。
 
 ## 同时下载多个
 

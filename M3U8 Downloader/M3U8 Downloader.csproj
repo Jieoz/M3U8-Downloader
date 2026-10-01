@@ -122,6 +122,10 @@
     <Compile Include="DouyinLive.cs" />
     <Compile Include="DownloadManager.cs" />
     <Compile Include="LiveCommon.cs" />
+    <Compile Include="PluginForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="StreamlinkPlugin.cs" />
     <Compile Include="Form1.cs">
       <SubType>Form</SubType>
     </Compile>
