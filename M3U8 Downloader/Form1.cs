@@ -23,14 +23,6 @@ namespace M3U8_Downloader
         TaskbarManager windowsTaskbar = TaskbarManager.Instance;
      
 
-        [DllImport("kernel32.dll")]
-        static extern bool GenerateConsoleCtrlEvent(int dwCtrlEvent, int dwProcessGroupId);
-        [DllImport("kernel32.dll")]
-        static extern bool SetConsoleCtrlHandler(IntPtr handlerRoutine, bool add);
-        [DllImport("kernel32.dll")]
-        static extern bool AttachConsole(int dwProcessId);
-        [DllImport("kernel32.dll")]
-        static extern bool FreeConsole();
         [DllImport("user32.dll")]
         public static extern bool FlashWindow(IntPtr hWnd,bool bInvert );
 
@@ -38,7 +30,11 @@ namespace M3U8_Downloader
         string CurrentLanguage = "default";
 
 
-        int ffmpegid = -1;
+        // 当前正在运行的 ffmpeg；为 null 表示空闲
+        Process m_proc;
+        // 用户点了停止：当前文件收尾后不再继续队列里的下一个
+        bool m_stopRequested;
+        System.Windows.Forms.Timer m_killTimer;
         string m_path;
         string m_proxy;
 
@@ -63,10 +59,7 @@ namespace M3U8_Downloader
 
         private void button_Stop_Click(object sender, EventArgs e)
         {
-            if (ffmpegid != -1)
-            {
-                Stop();
-            }
+            Stop();
         }
 
 
@@ -147,7 +140,7 @@ namespace M3U8_Downloader
                         this.Text = "[" + m_count.ToString() + " / " + m_urlList.Length.ToString() + "]" + "已完成：" +
                             String.Format("{0:F}", Progress) + "%";
                     }
-                    else
+                    else if (IsRunning())
                     {
                         ProgressBar.Style = ProgressBarStyle.Marquee;
                         this.Text = "[" + m_count.ToString() + " / " + m_urlList.Length.ToString() + "] " + label6;
@@ -260,40 +253,23 @@ namespace M3U8_Downloader
             doc.SelectSingleNode("//EnableProxy").InnerText = check.ToString();
             doc.Save(System.Environment.CurrentDirectory + "\\M3u8_Downloader_Settings.xml");
 
-            try
+            if (IsRunning())
             {
-                if (Process.GetProcessById(ffmpegid) != null)
+                if (MessageBox.Show("已启动下载进程，确认退出吗？", "请确认您的操作", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != System.Windows.Forms.DialogResult.Yes)
                 {
-                    if (MessageBox.Show("已启动下载进程，确认退出吗？\n（这有可能是强制的）", "请确认您的操作", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == System.Windows.Forms.DialogResult.Yes)
-                    {
-                        Stop();
-                        MessageBox.Show("已经发送命令！\n若进程仍然存在则强制结束！", "请确认");
-                        try
-                        {
-                            if (Process.GetProcessById(ffmpegid) != null)  //如果进程还存在就强制结束它
-                            {
-                                Process.GetProcessById(ffmpegid).Kill();
-                                Dispose();
-                                Application.Exit();
-                            }
-                        }
-                        catch
-                        {
-                            Dispose();
-                            Application.Exit();
-                        }
-
-                    }
-                    else
-                    {
-                        e.Cancel=true;
-                    }
+                    e.Cancel = true;
+                    return;
                 }
-            }
-            catch
-            {
-                Dispose();
-                Application.Exit();
+                Process proc = m_proc;
+                m_stopRequested = true;
+                SendQuit(proc);
+                // 给 ffmpeg 几秒写完文件尾，超时再强杀；分片 MP4 被强杀也能播
+                try
+                {
+                    if (!proc.WaitForExit(5000))
+                        proc.Kill();
+                }
+                catch { }
             }
         }
 
@@ -343,14 +319,8 @@ namespace M3U8_Downloader
 
         private void button_ForceStop_Click(object sender, EventArgs e)
         {
-            try
-            {
-                if (Process.GetProcessById(ffmpegid) != null)  //如果进程还存在就强制结束它
-                {
-                    Process.GetProcessById(ffmpegid).Kill();
-                }
-            }
-            catch { }
+            m_stopRequested = true;
+            KillCurrent();
         }
 
         private void 软件更新ToolStripMenuItem_Click(object sender, EventArgs e)
@@ -451,18 +421,31 @@ namespace M3U8_Downloader
                 input = stream.Url;
                 m_outPut += "Bilibili live " + roomId + " " + stream.FormatName + "/" + stream.CodecName + " qn=" + stream.Quality + "\r\n";
             }
-            string output = m_path + "\\" + textBox_Name.Text + index.ToString() + ".mp4";
+            string output = UniqueOutputPath(m_path, textBox_Name.Text + index.ToString());
             string proxy = menu_Proxy.Checked ? m_proxy : null;
             if (BilibiliLive.TryParseRoomId(line, out roomId))
                 return BilibiliLive.BuildRecordCommand(input, output, proxy);
             if (!string.IsNullOrWhiteSpace(proxy))
-                return "-http_proxy \"" + proxy + "\" -rw_timeout 10000000 -i \"" + input + "\" -c copy -y -bsf:a aac_adtstoasc -movflags +faststart \"" + output + "\"";
-            return "-rw_timeout 10000000 -i \"" + input + "\" -c copy -y -bsf:a aac_adtstoasc -movflags +faststart \"" + output + "\"";
+                return "-http_proxy \"" + proxy + "\" -rw_timeout 10000000 -i \"" + input + "\" -c copy -y -bsf:a aac_adtstoasc " + FragmentedMp4Flags + " \"" + output + "\"";
+            return "-rw_timeout 10000000 -i \"" + input + "\" -c copy -y -bsf:a aac_adtstoasc " + FragmentedMp4Flags + " \"" + output + "\"";
+        }
+
+        // 分片 MP4：每个关键帧写一段可独立解码的数据，进程被强杀也能播放，
+        // 不依赖结尾才写的 moov（+faststart 恰恰要等到正常结束才写）。
+        public const string FragmentedMp4Flags = "-movflags +frag_keyframe+empty_moov+default_base_moof -flush_packets 1";
+
+        // 已有同名文件时依次试 "名字 (1).mp4"、"名字 (2).mp4"，不覆盖上一次的录制
+        static string UniqueOutputPath(string dir, string baseName)
+        {
+            string path = Path.Combine(dir, baseName + ".mp4");
+            for (int n = 1; File.Exists(path); n++)
+                path = Path.Combine(dir, baseName + " (" + n + ").mp4");
+            return path;
         }
 
         private void Download()
         {
-            if (m_urlList != null)
+            if (m_urlList != null || IsRunning())
             {
                 MessageBox.Show("正在下载文件！" + Environment.NewLine + "Downloading file!", "M3U8 Downloader", MessageBoxButtons.OK, MessageBoxIcon.Information);  // 执行结束后触发
                 return;
@@ -472,6 +455,7 @@ namespace M3U8_Downloader
             //m_urlList = textBox_Adress.Text.Split(Environment.NewLine.ToCharArray());
             m_urlList = Regex.Split(textBox_Adress.Text, Environment.NewLine, RegexOptions.IgnoreCase);
             m_count = 0;
+            m_stopRequested = false;
 
             string command = BuildCommand(0);
 
@@ -498,10 +482,11 @@ namespace M3U8_Downloader
             CmdProcess.ErrorDataReceived += new DataReceivedEventHandler(p_ErrorDataReceived);
 
             CmdProcess.EnableRaisingEvents = true;                      // 启用Exited事件  
+            CmdProcess.SynchronizingObject = this;                      // Exited 回到 UI 线程，避免和进度条更新抢线程
             CmdProcess.Exited += new EventHandler(CmdProcess_Exited);   // 注册进程结束事件  
 
             CmdProcess.Start();
-            ffmpegid = CmdProcess.Id;//获取ffmpeg.exe的进程ID
+            m_proc = CmdProcess;
             CmdProcess.BeginOutputReadLine();
             CmdProcess.BeginErrorReadLine();
 
@@ -509,12 +494,51 @@ namespace M3U8_Downloader
             //CmdProcess.WaitForExit();  
         }
 
+        bool IsRunning()
+        {
+            try { return m_proc != null && !m_proc.HasExited; }
+            catch { return false; }
+        }
+
+        // 正常停止：给 ffmpeg 的 stdin 发 "q"，它会自己收尾写完文件。
+        // 旧做法 AttachConsole + SetConsoleCtrlHandler(NULL, TRUE) 会把"忽略 Ctrl+C"
+        // 遗传给之后启动的 ffmpeg，导致第二次下载点停止没反应。
         public void Stop()
         {
-            AttachConsole(ffmpegid);
-            SetConsoleCtrlHandler(IntPtr.Zero, true);
-            GenerateConsoleCtrlEvent(0, 0);
-            FreeConsole();
+            if (!IsRunning())
+                return;
+            m_stopRequested = true;
+            SendQuit(m_proc);
+
+            // 网络卡住时 ffmpeg 可能读不到 q；15 秒后仍未退出就强制结束
+            if (m_killTimer == null)
+            {
+                m_killTimer = new System.Windows.Forms.Timer();
+                m_killTimer.Interval = 15000;
+                m_killTimer.Tick += (s, ev) => { m_killTimer.Stop(); KillCurrent(); };
+            }
+            m_killTimer.Stop();
+            m_killTimer.Start();
+        }
+
+        static void SendQuit(Process proc)
+        {
+            try
+            {
+                proc.StandardInput.Write("q");
+                proc.StandardInput.Flush();
+            }
+            catch { }
+        }
+
+        void KillCurrent()
+        {
+            try
+            {
+                if (IsRunning())
+                    m_proc.Kill();
+            }
+            catch { }
         }
 
         //以下为实现异步输出CMD信息
@@ -528,18 +552,22 @@ namespace M3U8_Downloader
 
         private void p_OutputDataReceived(object sender, DataReceivedEventArgs e)
         {
-            if (e.Data != null)
+            // 只认当前进程的输出：上一个进程退出后迟到的行不能再把进度条拨回走马灯
+            if (e.Data != null && ReferenceEquals(sender, m_proc))
             {
                 // 4. 异步调用，需要invoke  
-                this.Invoke(ReadStdOutput, new object[] { e.Data });
+                string data = e.Data;
+                // 到 UI 线程再核一次：排队期间可能已经换成下一个进程
+                this.BeginInvoke((MethodInvoker)(() => { if (ReferenceEquals(sender, m_proc)) ReadStdOutput(data); }));
             }
         }
 
         private void p_ErrorDataReceived(object sender, DataReceivedEventArgs e)
         {
-            if (e.Data != null)
+            if (e.Data != null && ReferenceEquals(sender, m_proc))
             {
-                this.Invoke(ReadErrOutput, new object[] { e.Data });
+                string data = e.Data;
+                this.BeginInvoke((MethodInvoker)(() => { if (ReferenceEquals(sender, m_proc)) ReadErrOutput(data); }));
             }
         }
 
@@ -559,9 +587,25 @@ namespace M3U8_Downloader
 
         private void CmdProcess_Exited(object sender, EventArgs e)
         {
-            FlashWindow(this.Handle, true);
+            if (!ReferenceEquals(sender, m_proc))
+                return;
+            m_proc = null;
+            if (m_killTimer != null)
+                m_killTimer.Stop();
 
-            if (m_count == m_urlList.Length)
+            FlashWindow(this.Handle, true);
+            // 无论正常结束还是停止，都先让走马灯停下来
+            ProgressBar.Style = ProgressBarStyle.Continuous;
+
+            if (m_stopRequested)
+            {
+                m_urlList = null;
+                m_stopRequested = false;
+                this.Text = "M3U8 Downloader - 已停止";
+                ProgressBar.Value = 0;
+                windowsTaskbar.SetProgressState(TaskbarProgressBarState.NoProgress, this.Handle);
+            }
+            else if (m_count == m_urlList.Length)
             {
                 m_urlList = null;
                 this.Text = "M3U8 Downloader 2.0 by nilaoda & magicdmer";

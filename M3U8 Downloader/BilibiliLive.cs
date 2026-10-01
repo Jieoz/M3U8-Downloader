@@ -199,7 +199,7 @@ namespace M3U8_Downloader
             command.Append("-hide_banner -rw_timeout 15000000 -user_agent ").Append(Quote(UserAgent));
             command.Append(" -headers ").Append(Quote(FfmpegHeaders()));
             command.Append(" -i ").Append(Quote(inputUrl));
-            command.Append(" -c copy -y -movflags +faststart ");
+            command.Append(" -c copy -y ").Append(Form1.FragmentedMp4Flags).Append(' ');
             command.Append(Quote(outputPath));
             return command.ToString();
         }
