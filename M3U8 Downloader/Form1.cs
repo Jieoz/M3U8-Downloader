@@ -17,7 +17,7 @@ namespace M3U8_Downloader
 {
     public partial class Form1 : Form
     {
-        public const string AppVersion = "2.3.0";
+        public const string AppVersion = "2.4.0";
         const string ReleasesUrl = "https://github.com/Jieoz/M3U8-Downloader/releases";
 
         [DllImport("user32.dll")]
@@ -203,7 +203,7 @@ namespace M3U8_Downloader
         {
             bool en = CurrentLanguage == "en";
             label1.Text = en ? "Addresses (one per line, downloaded in parallel)" : "下载地址（每行一个，可同时下载多个）";
-            label2.Text = en ? "File name prefix (Video0.mp4, Video1.mp4 ...)" : "文件名前缀（Video0.mp4、Video1.mp4…）";
+            label2.Text = en ? "VOD name prefix (Video0.mp4 ...; live: anchor_room_time.mp4)" : "点播文件名前缀（Video0.mp4…；直播按 主播_房间号_时间 命名）";
             label_Parallel.Text = en ? "Parallel:" : "同时下载：";
             button_Download.Text = en ? "Start" : "开始下载";
             button_Clear.Text = en ? "Clear ended" : "清除已结束";
@@ -215,7 +215,7 @@ namespace M3U8_Downloader
                 listTasks.Columns[i].Text = cols[i];
             toolTip1.SetToolTip(button_Stop, en ? "Ask ffmpeg to finish the file (selected tasks, or all)" : "让 ffmpeg 收尾后停止（选中的任务；没选就是全部）");
             toolTip1.SetToolTip(button_ForceStop, en ? "Kill ffmpeg now; the part already written still plays" : "立即结束 ffmpeg；已下载的部分仍可播放");
-            toolTip1.SetToolTip(numParallel, en ? "Extra addresses wait in the queue" : "超过这个数的地址排队等待");
+            toolTip1.SetToolTip(numParallel, en ? "VOD only; extra addresses wait in the queue. Live rooms never queue." : "只限点播，超过的排队；直播间不占名额、开播就录");
             UpdateButtons();
             UpdateSummary();
             foreach (var pair in rows)
@@ -270,12 +270,32 @@ namespace M3U8_Downloader
             SetText(item, 2, en ? task.State.ToString() : DownloadManager.StateText(task.State));
             SetText(item, 3, ProgressText(task));
             SetText(item, 4, task.SizeBytes > 0 ? FormatFileSize(task.SizeBytes) : "");
-            string info = task.State == TaskState.Failed && task.Error.Length > 0 ? task.Error : (task.Info.Length > 0 ? task.Info : task.Source);
+            string info = InfoText(task);
             SetText(item, 5, info);
             item.ForeColor = task.State == TaskState.Failed ? Color.FromArgb(192, 57, 43)
                 : task.IsEnded && task.State != TaskState.Completed ? Color.DimGray : SystemColors.WindowText;
             item.ToolTipText = task.Source + (task.Error.Length > 0 ? Environment.NewLine + task.Error : "");
             listTasks.Invalidate(item.Bounds);
+        }
+
+        string InfoText(DownloadTask task)
+        {
+            bool en = CurrentLanguage == "en";
+            if (task.State == TaskState.Failed && task.Error.Length > 0)
+                return task.Error;
+            if (!task.IsLive)
+                return task.Info.Length > 0 ? task.Info : task.Source;
+            var parts = new List<string>();
+            parts.Add((en ? "Room " : "房间 ") + (task.RoomId.Length > 0 ? task.RoomId : task.Source));
+            if (task.Sessions > 0)
+                parts.Add(en ? task.Sessions + " recorded" : "已录 " + task.Sessions + " 场");
+            if (task.State == TaskState.Running || task.State == TaskState.Stopping)
+            {
+                if (task.Info.Length > 0) parts.Add(task.Info);
+            }
+            else if (task.Note.Length > 0)
+                parts.Add(task.Note);
+            return string.Join(en ? ", " : "，", parts);
         }
 
         static void SetText(ListViewItem item, int col, string text)
@@ -287,6 +307,8 @@ namespace M3U8_Downloader
         string ProgressText(DownloadTask task)
         {
             bool en = CurrentLanguage == "en";
+            if (task.State == TaskState.Waiting)
+                return (en ? "Next check " : "下次检查 ") + task.NextCheck.ToString("HH:mm:ss");
             if (task.State == TaskState.Queued || task.State == TaskState.Resolving || task.State == TaskState.Cancelled)
                 return "";
             string done = FormatTime(task.DoneSec);
@@ -311,7 +333,7 @@ namespace M3U8_Downloader
             using (var bg = new SolidBrush(selected ? SystemColors.Highlight : listTasks.BackColor))
                 e.Graphics.FillRectangle(bg, r);
             double pct = task.Percent;
-            if (pct >= 0 && task.State != TaskState.Queued && task.State != TaskState.Cancelled)
+            if (pct >= 0 && task.State != TaskState.Queued && task.State != TaskState.Cancelled && task.State != TaskState.Waiting)
             {
                 Rectangle bar = new Rectangle(r.X + 3, r.Y + 3, r.Width - 7, r.Height - 7);
                 using (var track = new SolidBrush(Color.FromArgb(230, 230, 230)))
@@ -340,13 +362,14 @@ namespace M3U8_Downloader
             var all = manager.Tasks.Where(t => t.State != TaskState.Cancelled).ToList();
             int running = all.Count(t => t.IsActive);
             int queued = all.Count(t => t.State == TaskState.Queued);
+            int waiting = all.Count(t => t.State == TaskState.Waiting);
             int done = all.Count(t => t.State == TaskState.Completed);
             int failed = all.Count(t => t.State == TaskState.Failed);
             int stopped = all.Count(t => t.State == TaskState.Stopped || t.State == TaskState.Killed);
 
             label7.Text = en
-                ? string.Format("Running {0}  Queued {1}  Done {2}  Failed {3}  Stopped {4}", running, queued, done, failed, stopped)
-                : string.Format("下载中 {0}　排队 {1}　完成 {2}　失败 {3}　已停止 {4}", running, queued, done, failed, stopped);
+                ? string.Format("Running {0}  Waiting {5}  Queued {1}  Done {2}  Failed {3}  Stopped {4}", running, queued, done, failed, stopped, waiting)
+                : string.Format("下载中 {0}　等待开播 {5}　排队 {1}　完成 {2}　失败 {3}　已停止 {4}", running, queued, done, failed, stopped, waiting);
 
             // 总进度：只算完成和进行中的任务。完成算 1，点播按百分比，直播算 0；
             // 停止/失败的不计入，否则全部停掉后会显示 100%
@@ -360,7 +383,7 @@ namespace M3U8_Downloader
             int value = counted == 0 ? 0 : (int)(sum / counted * 1000);
             ProgressBar.Value = Math.Max(0, Math.Min(1000, value));
 
-            bool busy = running + queued > 0;
+            bool busy = running + queued + waiting > 0;
             Text = busy
                 ? string.Format("M3U8 Downloader {0} - {1}", AppVersion, en ? running + " running" : "下载中 " + running)
                 : "M3U8 Downloader " + AppVersion;
@@ -412,13 +435,13 @@ namespace M3U8_Downloader
             cmOpenFolder.Text = en ? "Show in folder" : "打开所在位置";
             cmCopy.Text = en ? "Copy address and error" : "复制地址和错误";
             cmRemove.Text = en ? "Remove from list" : "从列表移除";
-            cmStop.Enabled = sel.Any(t => t.State == TaskState.Queued || t.State == TaskState.Resolving || t.State == TaskState.Running);
-            cmKill.Enabled = sel.Any(t => t.IsActive || t.State == TaskState.Queued);
+            cmStop.Enabled = sel.Any(t => t.State == TaskState.Queued || t.State == TaskState.Waiting || t.State == TaskState.Resolving || t.State == TaskState.Running);
+            cmKill.Enabled = sel.Any(t => t.IsActive || t.State == TaskState.Queued || t.State == TaskState.Waiting);
             cmRetry.Enabled = sel.Any(t => t.IsEnded);
             bool hasFile = sel.Any(HasFile);
             cmOpenFile.Enabled = hasFile;
             cmOpenFolder.Enabled = hasFile;
-            cmRemove.Enabled = sel.Any(t => !t.IsActive);
+            cmRemove.Enabled = sel.Any(t => !t.IsActive);   // 等待开播的移除 = 不再盯
         }
 
         static bool HasFile(DownloadTask t)
