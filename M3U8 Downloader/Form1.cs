@@ -1,51 +1,56 @@
 ﻿using System;
-using System.Drawing;
-using System.Linq;
-using System.Windows.Forms;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
-using System.Text.RegularExpressions;
-using System.IO;
-using System.Xml;
-using System.Text;
-using Microsoft.WindowsAPICodePack.Taskbar;
-using System.Threading;
-using System.Xml.Linq;
 using System.Collections.Generic;
-using System.Globalization;
 using System.ComponentModel;
+using System.Diagnostics;
+using System.Drawing;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Windows.Forms;
+using System.Xml;
+using System.Xml.Linq;
+using Microsoft.WindowsAPICodePack.Taskbar;
 
 namespace M3U8_Downloader
 {
     public partial class Form1 : Form
     {
-        //任务栏进度条的实现。
-        TaskbarManager windowsTaskbar = TaskbarManager.Instance;
-     
+        public const string AppVersion = "2.3.0";
+        const string ReleasesUrl = "https://github.com/Jieoz/M3U8-Downloader/releases";
 
         [DllImport("user32.dll")]
-        public static extern bool FlashWindow(IntPtr hWnd,bool bInvert );
+        public static extern bool FlashWindow(IntPtr hWnd, bool bInvert);
 
+        readonly TaskbarManager windowsTaskbar = TaskbarManager.Instance;
+        readonly DownloadManager manager;
+        readonly Dictionary<DownloadTask, ListViewItem> rows = new Dictionary<DownloadTask, ListViewItem>();
 
-        string CurrentLanguage = "default";
-
-
-        // 当前正在运行的 ffmpeg；为 null 表示空闲
-        Process m_proc;
-        // 用户点了停止：当前文件收尾后不再继续队列里的下一个
-        bool m_stopRequested;
-        System.Windows.Forms.Timer m_killTimer;
+        string CurrentLanguage = "zh";
         string m_path;
         string m_proxy;
+
+        // 代码里加的控件（设计器里只有旧的单任务界面）
+        ListView listTasks;
+        Button button_Clear;
+        Label label_Parallel;
+        NumericUpDown numParallel;
+        ContextMenuStrip taskMenu;
+        ToolStripMenuItem cmStop, cmKill, cmRetry, cmOpenFile, cmOpenFolder, cmCopy, cmRemove;
+
+        const int ColProgress = 3;
+
+        string SettingsPath { get { return Path.Combine(Environment.CurrentDirectory, "M3u8_Downloader_Settings.xml"); } }
 
         //不影响点击任务栏图标最大最小化
         protected override CreateParams CreateParams
         {
             get
             {
-                const int WS_MINIMIZEBOX = 0x00020000;  // Winuser.h中定义
+                const int WS_MINIMIZEBOX = 0x00020000;
                 CreateParams cp = base.CreateParams;
-                cp.Style = cp.Style | WS_MINIMIZEBOX;   // 允许最小化操作
+                cp.Style = cp.Style | WS_MINIMIZEBOX;
                 return cp;
             }
         }
@@ -53,229 +58,585 @@ namespace M3U8_Downloader
         public Form1()
         {
             InitializeComponent();
-            Init();
-            Control.CheckForIllegalCrossThreadCalls = false;  //禁止编译器对跨线程访问做检查
+            manager = new DownloadManager(a => { if (IsHandleCreated && !IsDisposed) BeginInvoke(a); });
+            manager.OutputDir = () => m_path;
+            manager.Proxy = () => menu_Proxy.Checked ? m_proxy : null;
+            manager.TaskAdded += AddRow;
+            manager.TaskChanged += UpdateRow;
+            manager.TaskRemoved += RemoveRow;
+            manager.BecameIdle += OnIdle;
+            BuildTaskUi();
+            ApplyLayout();
+            ApplyTexts();
+        }
+
+        // ---------------- 界面 ----------------
+
+        void BuildTaskUi()
+        {
+            // 旧的单任务控件不再用
+            textBox_forRegex.Visible = false;
+            label8.Visible = false;
+
+            listTasks = new ListView
+            {
+                View = View.Details,
+                FullRowSelect = true,
+                HideSelection = false,
+                MultiSelect = true,
+                OwnerDraw = true,
+                ShowItemToolTips = true,
+                Font = new Font("Microsoft YaHei", 9F),
+            };
+            typeof(Control).GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                .SetValue(listTasks, true, null);
+            listTasks.Columns.Add("#", 36);
+            listTasks.Columns.Add("文件", 130);
+            listTasks.Columns.Add("状态", 76);
+            listTasks.Columns.Add("进度", 190);
+            listTasks.Columns.Add("大小", 84);
+            listTasks.Columns.Add("信息", 210);
+            listTasks.DrawColumnHeader += (s, e) => e.DrawDefault = true;
+            listTasks.DrawItem += (s, e) => { };
+            listTasks.DrawSubItem += DrawSubItem;
+            listTasks.SelectedIndexChanged += (s, e) => UpdateButtons();
+            listTasks.DoubleClick += (s, e) => OpenSelectedFile();
+            listTasks.KeyDown += ListTasks_KeyDown;
+
+            taskMenu = new ContextMenuStrip();
+            cmStop = new ToolStripMenuItem("停止", null, (s, e) => ForSelected(manager.Stop));
+            cmKill = new ToolStripMenuItem("强制停止", null, (s, e) => ForSelected(manager.Kill));
+            cmRetry = new ToolStripMenuItem("重新下载", null, (s, e) => ForSelected(manager.Retry));
+            cmOpenFile = new ToolStripMenuItem("播放文件", null, (s, e) => OpenSelectedFile());
+            cmOpenFolder = new ToolStripMenuItem("打开所在位置", null, (s, e) => RevealSelected());
+            cmCopy = new ToolStripMenuItem("复制地址和错误", null, (s, e) => CopySelected());
+            cmRemove = new ToolStripMenuItem("从列表移除", null, (s, e) => ForSelected(manager.Remove));
+            taskMenu.Items.AddRange(new ToolStripItem[] { cmStop, cmKill, cmRetry, new ToolStripSeparator(), cmOpenFile, cmOpenFolder, cmCopy, new ToolStripSeparator(), cmRemove });
+            taskMenu.Opening += TaskMenu_Opening;
+            listTasks.ContextMenuStrip = taskMenu;
+
+            button_Clear = new Button { UseVisualStyleBackColor = true };
+            button_Clear.Click += (s, e) => manager.ClearEnded();
+
+            label_Parallel = new Label { AutoSize = true };
+            numParallel = new NumericUpDown { Minimum = 1, Maximum = 8, Value = 3 };
+            numParallel.ValueChanged += (s, e) => manager.MaxParallel = (int)numParallel.Value;
+
+            Controls.Add(listTasks);
+            Controls.Add(button_Clear);
+            Controls.Add(label_Parallel);
+            Controls.Add(numParallel);
+
+            ProgressBar.Style = ProgressBarStyle.Continuous;
+            ProgressBar.Minimum = 0;
+            ProgressBar.Maximum = 1000;
+            label7.Visible = true;
+            label7.AutoSize = false;
+            label7.TextAlign = ContentAlignment.MiddleLeft;
+            // 设计器给 label1 用的是 ActiveCaptionText，部分主题下是白字，看不清
+            label1.ForeColor = label2.ForeColor = label7.ForeColor = SystemColors.ControlText;
+        }
+
+        // 设计器是 520x401 的单任务窗口；这里按 DPI 重新排版成任务列表窗口。
+        // 切换语言会用 resx 把旧坐标套回去，所以 ChangeLanguage 之后也要再调一次。
+        void ApplyLayout()
+        {
+            float k;
+            using (Graphics g = CreateGraphics())
+                k = g.DpiX / 96f;
+            Func<int, int> S = v => (int)Math.Round(v * k);
+
+            SuspendLayout();
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
+            // 先把锚点全部去掉再改尺寸，否则改 ClientSize 时旧锚点会把控件拉变形
+            foreach (Control c in Controls)
+                c.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+            ClientSize = new Size(S(760), S(620));
+            MinimumSize = new Size(S(640), S(520));
+            int W = ClientSize.Width, H = ClientSize.Height;
+            int pad = S(12), inner = W - 2 * pad;
+
+            menuStrip1.Dock = DockStyle.None;
+            menuStrip1.Location = new Point(W - menuStrip1.Width - S(6), S(3));
+            menuStrip1.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+
+            label1.Location = new Point(pad, S(12));
+            textBox_Adress.Location = new Point(pad, S(34));
+            textBox_Adress.Size = new Size(inner, S(110));
+            textBox_Adress.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+
+            label2.Location = new Point(pad, S(152));
+            textBox_Name.Location = new Point(pad, S(172));
+            textBox_Name.Size = new Size(S(300), S(23));
+            label_Parallel.Location = new Point(S(330), S(176));
+            numParallel.Location = new Point(S(420), S(172));
+            numParallel.Size = new Size(S(56), S(23));
+
+            int by = S(206), bw = S(112), bh = S(34), gap = S(8);
+            Button[] buttons = { button_Download, button_Stop, button_ForceStop, button_Clear, button_OpenFolder };
+            for (int i = 0; i < buttons.Length; i++)
+            {
+                buttons[i].Location = new Point(pad + i * (bw + gap), by);
+                buttons[i].Size = new Size(bw, bh);
+            }
+
+            int listTop = by + bh + S(10);
+            int bottomArea = S(54);
+            listTasks.Location = new Point(pad, listTop);
+            listTasks.Size = new Size(inner, H - listTop - bottomArea);
+            listTasks.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            int[] widths = { 36, 130, 76, 190, 84, 210 };
+            for (int i = 0; i < widths.Length; i++)
+                listTasks.Columns[i].Width = S(widths[i]);
+
+            ProgressBar.Location = new Point(pad, H - bottomArea + S(8));
+            ProgressBar.Size = new Size(inner, S(14));
+            ProgressBar.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            label7.Location = new Point(pad, H - bottomArea + S(26));
+            label7.Size = new Size(inner, S(22));
+            label7.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            ResumeLayout(true);
+        }
+
+        void ApplyTexts()
+        {
+            bool en = CurrentLanguage == "en";
+            label1.Text = en ? "Addresses (one per line, downloaded in parallel)" : "下载地址（每行一个，可同时下载多个）";
+            label2.Text = en ? "File name prefix (Video0.mp4, Video1.mp4 ...)" : "文件名前缀（Video0.mp4、Video1.mp4…）";
+            label_Parallel.Text = en ? "Parallel:" : "同时下载：";
+            button_Download.Text = en ? "Start" : "开始下载";
+            button_Clear.Text = en ? "Clear ended" : "清除已结束";
+            button_OpenFolder.Text = en ? "Open folder" : "打开目录";
+            string[] cols = en
+                ? new[] { "#", "File", "State", "Progress", "Size", "Info" }
+                : new[] { "#", "文件", "状态", "进度", "大小", "信息" };
+            for (int i = 0; i < cols.Length; i++)
+                listTasks.Columns[i].Text = cols[i];
+            toolTip1.SetToolTip(button_Stop, en ? "Ask ffmpeg to finish the file (selected tasks, or all)" : "让 ffmpeg 收尾后停止（选中的任务；没选就是全部）");
+            toolTip1.SetToolTip(button_ForceStop, en ? "Kill ffmpeg now; the part already written still plays" : "立即结束 ffmpeg；已下载的部分仍可播放");
+            toolTip1.SetToolTip(numParallel, en ? "Extra addresses wait in the queue" : "超过这个数的地址排队等待");
+            UpdateButtons();
+            UpdateSummary();
+            foreach (var pair in rows)
+                FillRow(pair.Value, pair.Key);
+        }
+
+        void UpdateButtons()
+        {
+            bool en = CurrentLanguage == "en";
+            bool sel = listTasks.SelectedItems.Count > 0;
+            button_Stop.Text = sel ? (en ? "Stop selected" : "停止选中") : (en ? "Stop all" : "全部停止");
+            button_ForceStop.Text = sel ? (en ? "Kill selected" : "强制停止选中") : (en ? "Kill all" : "全部强制停止");
+        }
+
+        // ---------------- 任务列表 ----------------
+
+        void AddRow(DownloadTask task)
+        {
+            var item = new ListViewItem(new string[6]) { Tag = task };
+            rows[task] = item;
+            FillRow(item, task);
+            listTasks.Items.Add(item);
+            item.EnsureVisible();
+            UpdateSummary();
+        }
+
+        void RemoveRow(DownloadTask task)
+        {
+            ListViewItem item;
+            if (rows.TryGetValue(task, out item))
+            {
+                listTasks.Items.Remove(item);
+                rows.Remove(task);
+            }
+            UpdateButtons();
+            UpdateSummary();
+        }
+
+        void UpdateRow(DownloadTask task)
+        {
+            ListViewItem item;
+            if (rows.TryGetValue(task, out item))
+                FillRow(item, task);
+            UpdateSummary();
+        }
+
+        void FillRow(ListViewItem item, DownloadTask task)
+        {
+            bool en = CurrentLanguage == "en";
+            SetText(item, 0, task.Id.ToString());
+            SetText(item, 1, task.FileName);
+            SetText(item, 2, en ? task.State.ToString() : DownloadManager.StateText(task.State));
+            SetText(item, 3, ProgressText(task));
+            SetText(item, 4, task.SizeBytes > 0 ? FormatFileSize(task.SizeBytes) : "");
+            string info = task.State == TaskState.Failed && task.Error.Length > 0 ? task.Error : (task.Info.Length > 0 ? task.Info : task.Source);
+            SetText(item, 5, info);
+            item.ForeColor = task.State == TaskState.Failed ? Color.FromArgb(192, 57, 43)
+                : task.IsEnded && task.State != TaskState.Completed ? Color.DimGray : SystemColors.WindowText;
+            item.ToolTipText = task.Source + (task.Error.Length > 0 ? Environment.NewLine + task.Error : "");
+            listTasks.Invalidate(item.Bounds);
+        }
+
+        static void SetText(ListViewItem item, int col, string text)
+        {
+            if (item.SubItems[col].Text != text)
+                item.SubItems[col].Text = text;
+        }
+
+        string ProgressText(DownloadTask task)
+        {
+            bool en = CurrentLanguage == "en";
+            if (task.State == TaskState.Queued || task.State == TaskState.Resolving || task.State == TaskState.Cancelled)
+                return "";
+            string done = FormatTime(task.DoneSec);
+            if (task.DurationSec > 0)
+                return string.Format(CultureInfo.InvariantCulture, "{0:0.0}%  {1} / {2}", task.Percent, done, FormatTime(task.DurationSec));
+            if (!task.IsLive)
+                return (en ? "Downloaded " : "已下载 ") + done;   // 点播还没读到总时长
+            return (task.IsActive ? (en ? "Live " : "直播 ") : (en ? "Recorded " : "已录 ")) + done;
+        }
+
+        // 进度列画成静态条：点播按百分比，直播（无总时长）只写时间。不用走马灯，停止后不会自己动
+        void DrawSubItem(object sender, DrawListViewSubItemEventArgs e)
+        {
+            if (e.ColumnIndex != ColProgress)
+            {
+                e.DrawDefault = true;
+                return;
+            }
+            var task = (DownloadTask)e.Item.Tag;
+            Rectangle r = e.Bounds;
+            bool selected = e.Item.Selected;
+            using (var bg = new SolidBrush(selected ? SystemColors.Highlight : listTasks.BackColor))
+                e.Graphics.FillRectangle(bg, r);
+            double pct = task.Percent;
+            if (pct >= 0 && task.State != TaskState.Queued && task.State != TaskState.Cancelled)
+            {
+                Rectangle bar = new Rectangle(r.X + 3, r.Y + 3, r.Width - 7, r.Height - 7);
+                using (var track = new SolidBrush(Color.FromArgb(230, 230, 230)))
+                    e.Graphics.FillRectangle(track, bar);
+                Color fill = task.State == TaskState.Failed ? Color.FromArgb(231, 76, 60)
+                    : task.IsEnded && task.State != TaskState.Completed ? Color.FromArgb(160, 160, 160)
+                    : Color.FromArgb(46, 160, 67);
+                int w = (int)(bar.Width * pct / 100.0);
+                if (w > 0)
+                    using (var b = new SolidBrush(fill))
+                        e.Graphics.FillRectangle(b, bar.X, bar.Y, w, bar.Height);
+                TextRenderer.DrawText(e.Graphics, e.SubItem.Text, listTasks.Font, bar, Color.Black,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            }
+            else
+            {
+                TextRenderer.DrawText(e.Graphics, e.SubItem.Text, listTasks.Font, r,
+                    selected ? SystemColors.HighlightText : listTasks.ForeColor,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            }
+        }
+
+        void UpdateSummary()
+        {
+            bool en = CurrentLanguage == "en";
+            var all = manager.Tasks.Where(t => t.State != TaskState.Cancelled).ToList();
+            int running = all.Count(t => t.IsActive);
+            int queued = all.Count(t => t.State == TaskState.Queued);
+            int done = all.Count(t => t.State == TaskState.Completed);
+            int failed = all.Count(t => t.State == TaskState.Failed);
+            int stopped = all.Count(t => t.State == TaskState.Stopped || t.State == TaskState.Killed);
+
+            label7.Text = en
+                ? string.Format("Running {0}  Queued {1}  Done {2}  Failed {3}  Stopped {4}", running, queued, done, failed, stopped)
+                : string.Format("下载中 {0}　排队 {1}　完成 {2}　失败 {3}　已停止 {4}", running, queued, done, failed, stopped);
+
+            // 总进度：只算完成和进行中的任务。完成算 1，点播按百分比，直播算 0；
+            // 停止/失败的不计入，否则全部停掉后会显示 100%
+            double sum = 0;
+            int counted = 0;
+            foreach (var t in all)
+            {
+                if (t.State == TaskState.Completed) { sum += 1; counted++; }
+                else if (!t.IsEnded) { sum += Math.Max(0, t.Percent) / 100.0; counted++; }
+            }
+            int value = counted == 0 ? 0 : (int)(sum / counted * 1000);
+            ProgressBar.Value = Math.Max(0, Math.Min(1000, value));
+
+            bool busy = running + queued > 0;
+            Text = busy
+                ? string.Format("M3U8 Downloader {0} - {1}", AppVersion, en ? running + " running" : "下载中 " + running)
+                : "M3U8 Downloader " + AppVersion;
+            if (!IsHandleCreated)
+                return;
+            try
+            {
+                if (!busy)
+                    windowsTaskbar.SetProgressState(TaskbarProgressBarState.NoProgress, Handle);
+                else
+                {
+                    windowsTaskbar.SetProgressState(TaskbarProgressBarState.Normal, Handle);
+                    windowsTaskbar.SetProgressValue(Math.Max(1, value), 1000, Handle);
+                }
+            }
+            catch { }
+        }
+
+        void OnIdle()
+        {
+            FlashWindow(Handle, true);
+            UpdateSummary();
+        }
+
+        List<DownloadTask> SelectedTasks()
+        {
+            return listTasks.SelectedItems.Cast<ListViewItem>().Select(i => (DownloadTask)i.Tag).ToList();
+        }
+
+        void ForSelected(Action<DownloadTask> action)
+        {
+            foreach (var t in SelectedTasks())
+                action(t);
+        }
+
+        void TaskMenu_Opening(object sender, CancelEventArgs e)
+        {
+            var sel = SelectedTasks();
+            if (sel.Count == 0)
+            {
+                e.Cancel = true;
+                return;
+            }
+            bool en = CurrentLanguage == "en";
+            cmStop.Text = en ? "Stop" : "停止";
+            cmKill.Text = en ? "Kill" : "强制停止";
+            cmRetry.Text = en ? "Download again" : "重新下载";
+            cmOpenFile.Text = en ? "Play file" : "播放文件";
+            cmOpenFolder.Text = en ? "Show in folder" : "打开所在位置";
+            cmCopy.Text = en ? "Copy address and error" : "复制地址和错误";
+            cmRemove.Text = en ? "Remove from list" : "从列表移除";
+            cmStop.Enabled = sel.Any(t => t.State == TaskState.Queued || t.State == TaskState.Resolving || t.State == TaskState.Running);
+            cmKill.Enabled = sel.Any(t => t.IsActive || t.State == TaskState.Queued);
+            cmRetry.Enabled = sel.Any(t => t.IsEnded);
+            bool hasFile = sel.Any(HasFile);
+            cmOpenFile.Enabled = hasFile;
+            cmOpenFolder.Enabled = hasFile;
+            cmRemove.Enabled = sel.Any(t => !t.IsActive);
+        }
+
+        static bool HasFile(DownloadTask t)
+        {
+            return t.OutputPath != null && File.Exists(t.OutputPath);
+        }
+
+        void ListTasks_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Delete)
+                ForSelected(manager.Remove);
+            else if (e.Control && e.KeyCode == Keys.A)
+                foreach (ListViewItem i in listTasks.Items) i.Selected = true;
+            else if (e.Control && e.KeyCode == Keys.C)
+                CopySelected();
+        }
+
+        void OpenSelectedFile()
+        {
+            var t = SelectedTasks().FirstOrDefault(HasFile);
+            if (t != null)
+                try { Process.Start(t.OutputPath); } catch (Exception ex) { MessageBox.Show(ex.Message); }
+        }
+
+        void RevealSelected()
+        {
+            var t = SelectedTasks().FirstOrDefault(HasFile);
+            if (t != null)
+                Process.Start("explorer.exe", "/select,\"" + t.OutputPath + "\"");
+        }
+
+        void CopySelected()
+        {
+            var sb = new StringBuilder();
+            foreach (var t in SelectedTasks())
+            {
+                sb.AppendLine(t.Source);
+                if (t.Error.Length > 0)
+                    sb.AppendLine("  " + t.Error);
+            }
+            if (sb.Length > 0)
+                Clipboard.SetText(sb.ToString());
+        }
+
+        // ---------------- 按钮 ----------------
+
+        private void button_Download_Click(object sender, EventArgs e)
+        {
+            if (string.IsNullOrWhiteSpace(textBox_Adress.Text))
+                return;
+            try
+            {
+                if (!Directory.Exists(m_path))
+                    Directory.CreateDirectory(m_path);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("保存目录不可用：" + ex.Message, "M3U8 Downloader", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            string prefix = textBox_Name.Text.Trim();
+            if (prefix.Length == 0)
+                prefix = "Video";
+            manager.MaxParallel = (int)numParallel.Value;
+            if (manager.AddLines(textBox_Adress.Text, prefix).Count > 0)
+                textBox_Adress.Clear();   // 已经进了列表；不清空的话再点一次会重复下载
         }
 
         private void button_Stop_Click(object sender, EventArgs e)
         {
-            Stop();
+            if (listTasks.SelectedItems.Count > 0)
+                ForSelected(manager.Stop);
+            else
+                manager.StopAll();
         }
 
+        private void button_ForceStop_Click(object sender, EventArgs e)
+        {
+            if (listTasks.SelectedItems.Count > 0)
+            {
+                ForSelected(manager.Kill);
+                return;
+            }
+            if (!manager.IsBusy)
+                return;
+            string msg = CurrentLanguage == "en"
+                ? "Kill all downloads now? The part already written stays playable."
+                : "立即强制停止全部任务吗？已下载的部分仍可播放。";
+            if (MessageBox.Show(msg, "M3U8 Downloader", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                manager.KillAll();
+        }
 
-        //格式化大小输出
+        private void button_OpenFolder_Click(object sender, EventArgs e)
+        {
+            try { Process.Start(m_path); } catch (Exception ex) { MessageBox.Show(ex.Message); }
+        }
+
+        // ---------------- 设置 ----------------
+
         public static String FormatFileSize(Double fileSize)
         {
             if (fileSize < 0)
-            {
                 throw new ArgumentOutOfRangeException("fileSize");
-            }
-            else if (fileSize >= 1024 * 1024 * 1024)
-            {
-                return string.Format("{0:########0.00} GB", ((Double)fileSize) / (1024 * 1024 * 1024));
-            }
-            else if (fileSize >= 1024 * 1024)
-            {
-                return string.Format("{0:####0.00} MB", ((Double)fileSize) / (1024 * 1024));
-            }
-            else if (fileSize >= 1024)
-            {
-                return string.Format("{0:####0.00} KB", ((Double)fileSize) / 1024);
-            }
-            else
-            {
-                return string.Format("{0} bytes", fileSize);
-            }
+            if (fileSize >= 1024 * 1024 * 1024)
+                return string.Format("{0:0.00} GB", fileSize / (1024 * 1024 * 1024));
+            if (fileSize >= 1024 * 1024)
+                return string.Format("{0:0.00} MB", fileSize / (1024 * 1024));
+            if (fileSize >= 1024)
+                return string.Format("{0:0.00} KB", fileSize / 1024);
+            return string.Format("{0} B", fileSize);
         }
 
-        private void textBox_Info_TextChanged()
+        static string FormatTime(double sec)
         {
-
-            Regex regex = new Regex(@"(\d\d[.:]){3}\d\d", RegexOptions.Compiled | RegexOptions.Singleline);//取视频时长以及Time属性
-            var time = regex.Matches(textBox_forRegex.Text);
-
-            Regex size = new Regex(@"[1-9][0-9]{0,}kB time", RegexOptions.Compiled | RegexOptions.Singleline);//取已下载大小
-            var sizekb = size.Matches(textBox_forRegex.Text);
-
-            Regex duration = new Regex(@"Duration: (\d\d[.:]){3}\d\d", RegexOptions.Compiled | RegexOptions.Singleline);//取总视频时长
-            bool hasDuration = duration.IsMatch(m_outPut);
-            string label5 = hasDuration
-                ? "[总时长：" + duration.Match(m_outPut).Value.Replace("Duration: ", "") + "]"
-                : "[直播：无总时长]";
-
-            string label6 = "[已下载：，]";
-            if (time.Count > 0 && sizekb.Count > 0)
-            {
-                label6 = "[已下载：" + time.OfType<Match>().Last() + "，" + FormatFileSize(Convert.ToDouble(sizekb.OfType<Match>().Last().ToString().Replace("kB time", "")) * 1024) + "]";
-            }
-
-            Regex fps = new Regex(@", (\S+)\sfps", RegexOptions.Compiled | RegexOptions.Singleline);//取视频帧数
-            Regex resolution = new Regex(@", \d{2,}x\d{2,}", RegexOptions.Compiled | RegexOptions.Singleline);//取视频分辨率
-            label7.Text = "[视频信息：" + resolution.Match(m_outPut).Value.Replace(", ", "") + "，" + fps.Match(m_outPut).Value.Replace(", ", "") + "]";
-
-            if (time.Count > 0 && sizekb.Count > 0)  //防止程序太快 无法截取
-            {
-                try
-                {
-                    if (hasDuration)
-                    {
-                        ProgressBar.Style = ProgressBarStyle.Continuous;
-                        Double All = Convert.ToDouble(Convert.ToDouble(label5.Substring(5, 2)) * 60 * 60 + Convert.ToDouble(label5.Substring(8, 2)) * 60
-                        + Convert.ToDouble(label5.Substring(11, 2)) + Convert.ToDouble(label5.Substring(14, 2)) / 100);
-                        Double Downloaded = Convert.ToDouble(Convert.ToDouble(label6.Substring(5, 2)) * 60 * 60 + Convert.ToDouble(label6.Substring(8, 2)) * 60
-                        + Convert.ToDouble(label6.Substring(11, 2)) + Convert.ToDouble(label6.Substring(14, 2)) / 100);
-
-                        if (All == 0) All = 1;  //防止被除数为零导致程序崩溃
-                        Double Progress = (Downloaded / All) * 100;
-
-                        if (Progress > 100)  //防止进度条超过百分之百
-                            Progress = 100;
-                        if (Progress < 0)  //防止进度条小于零……
-                            Progress = 0;
-
-                        ProgressBar.Value = Convert.ToInt32(Progress);
-                        windowsTaskbar.SetProgressValue(Convert.ToInt32(Progress), 100, this.Handle);
-                        Application.DoEvents();
-
-                        this.Text = "[" + m_count.ToString() + " / " + m_urlList.Length.ToString() + "]" + "已完成：" +
-                            String.Format("{0:F}", Progress) + "%";
-                    }
-                    else if (IsRunning())
-                    {
-                        ProgressBar.Style = ProgressBarStyle.Marquee;
-                        this.Text = "[" + m_count.ToString() + " / " + m_urlList.Length.ToString() + "] " + label6;
-                    }
-                }
-                catch (Exception)
-                {
-                    try
-                    {
-                        label5 = "[总时长：NULL]";
-                        Double Downloaded = Convert.ToDouble(Convert.ToDouble(label6.Substring(5, 2)) * 60 * 60 + Convert.ToDouble(label6.Substring(8, 2)) * 60
-                    + Convert.ToDouble(label6.Substring(11, 2)) + Convert.ToDouble(label6.Substring(14, 2)) / 100);
-                        Double Progress = 100;
-
-                        if (Progress > 100)  //防止进度条超过百分之百
-                            Progress = 100;
-                        if (Progress < 0)  //防止进度条小于零……
-                            Progress = 0;
-
-                        ProgressBar.Value = Convert.ToInt32(Progress);
-                        windowsTaskbar.SetProgressValue(Convert.ToInt32(Progress), 100, this.Handle);
-                        Application.DoEvents();
-
-                        this.Text = "[" + m_count.ToString() + " / " + m_urlList.Length.ToString() + "]" + "已完成：" +
-                        String.Format("{0:F}", Progress) + "%";
-                    }
-                    catch (Exception) { }
-                }
-            }
+            if (sec < 0) sec = 0;
+            var t = TimeSpan.FromSeconds(Math.Floor(sec));
+            return string.Format("{0:00}:{1:00}:{2:00}", (int)t.TotalHours, t.Minutes, t.Seconds);
         }
 
         public void CreateSettingFile(string xmlPath)
         {
-            XElement xElement = new XElement(
-                new XElement("Settings",
-                    new XElement("DownPath", m_path),
-                    new XElement("EnableProxy",0),
-                    new XElement("HttpProxy",m_proxy)
-                ));
-
-            //需要指定编码格式，否则在读取时会抛：根级别上的数据无效。 第 1 行 位置 1异常
-            XmlWriterSettings settings = new XmlWriterSettings();
-            settings.Encoding = new UTF8Encoding(false);
-            settings.Indent = true;
-            XmlWriter xw = XmlWriter.Create(xmlPath, settings);
-            xElement.Save(xw);
-            //写入文件
-            xw.Flush();
-            xw.Close();
+            XElement xElement = new XElement("Settings",
+                new XElement("DownPath", m_path),
+                new XElement("EnableProxy", 0),
+                new XElement("HttpProxy", m_proxy),
+                new XElement("MaxParallel", 3));
+            XmlWriterSettings settings = new XmlWriterSettings { Encoding = new UTF8Encoding(false), Indent = true };
+            using (XmlWriter xw = XmlWriter.Create(xmlPath, settings))
+                xElement.Save(xw);
         }
 
         private void Form1_Load(object sender, EventArgs e)
         {
-            ////初始化进度条
-            windowsTaskbar.SetProgressState(TaskbarProgressBarState.Normal, this.Handle);
-            windowsTaskbar.SetProgressValue(0, 100, this.Handle);
-            toolTip1.SetToolTip(button_Stop, "发送停止指令，等待ffmpeg停止");
-            toolTip1.SetToolTip(button_ForceStop, "直接终止ffmpeg进程");
-
-            if (!File.Exists(@"Tools\ffmpeg.exe"))  //判断程序目录有无ffmpeg.exe
+            if (!File.Exists(manager.FfmpegPath))
             {
                 MessageBox.Show("没有找到Tools\\ffmpeg.exe" + Environment.NewLine + "Missing Tools\\ffmpeg.exe", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 Dispose();
                 Application.Exit();
+                return;
             }
 
-            if (File.Exists(System.Environment.CurrentDirectory + "\\M3u8_Downloader_Settings.xml"))  //判断程序目录有无配置文件，并读取文件
+            if (File.Exists(SettingsPath))
             {
-                XmlDocument doc = new XmlDocument();
-                doc.Load(System.Environment.CurrentDirectory + "\\M3u8_Downloader_Settings.xml");    //加载Xml文件  
-                m_path = doc.SelectSingleNode("//DownPath").InnerText;
-                m_proxy = doc.SelectSingleNode("//HttpProxy").InnerText;
-                int enableProxy = int.Parse(doc.SelectSingleNode("//EnableProxy").InnerText);
-                if (enableProxy == 1)
+                try
                 {
-                    menu_Proxy.CheckState = CheckState.Checked;
+                    XmlDocument doc = new XmlDocument();
+                    doc.Load(SettingsPath);
+                    m_path = doc.SelectSingleNode("//DownPath").InnerText;
+                    m_proxy = doc.SelectSingleNode("//HttpProxy").InnerText;
+                    menu_Proxy.CheckState = doc.SelectSingleNode("//EnableProxy").InnerText.Trim() == "1" ? CheckState.Checked : CheckState.Unchecked;
+                    XmlNode par = doc.SelectSingleNode("//MaxParallel");
+                    int n;
+                    if (par != null && int.TryParse(par.InnerText, out n))
+                        numParallel.Value = Math.Max(numParallel.Minimum, Math.Min(numParallel.Maximum, n));
                 }
-                else
+                catch
                 {
-                    menu_Proxy.CheckState = CheckState.Unchecked;
+                    m_path = Environment.CurrentDirectory;
+                    m_proxy = "";
                 }
             }
-            else  //若无配置文件，获取当前程序运行路径，即为默认下载路径
+            else
             {
-                m_path = System.Environment.CurrentDirectory;
+                m_path = Environment.CurrentDirectory;
                 m_proxy = "";
-
-                CreateSettingFile(System.Environment.CurrentDirectory + "\\M3u8_Downloader_Settings.xml");
+                CreateSettingFile(SettingsPath);
             }
-
+            if (string.IsNullOrWhiteSpace(m_path))
+                m_path = Environment.CurrentDirectory;
+            if (m_proxy == null)
+                m_proxy = "";
+            manager.MaxParallel = (int)numParallel.Value;
+            UpdateSummary();
         }
 
-        private void textBox_Adress_KeyPress(object sender, KeyPressEventArgs e)
+        void SaveSettingsOnExit()
         {
-            TextBox textBox = sender as TextBox;
-            if (textBox == null)
-                return;
-            if (e.KeyChar == (char)1)       // Ctrl-A 相当于输入了AscII=1的控制字符
+            try
             {
-                textBox.SelectAll();
-                e.Handled = true;      // 不再发出“噔”的声音
+                if (!File.Exists(SettingsPath))
+                    CreateSettingFile(SettingsPath);
+                XmlDocument doc = new XmlDocument();
+                doc.Load(SettingsPath);
+                doc.SelectSingleNode("//EnableProxy").InnerText = menu_Proxy.Checked ? "1" : "0";
+                XmlNode par = doc.SelectSingleNode("//MaxParallel");
+                if (par == null)
+                {
+                    par = doc.CreateElement("MaxParallel");
+                    doc.DocumentElement.AppendChild(par);
+                }
+                par.InnerText = ((int)numParallel.Value).ToString();
+                doc.Save(SettingsPath);
             }
+            catch { }
         }
 
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
-            XmlDocument doc = new XmlDocument();
-            doc.Load(System.Environment.CurrentDirectory + "\\M3u8_Downloader_Settings.xml");    //加载Xml文件  
-            int check = Convert.ToInt32(menu_Proxy.Checked);
-            doc.SelectSingleNode("//EnableProxy").InnerText = check.ToString();
-            doc.Save(System.Environment.CurrentDirectory + "\\M3u8_Downloader_Settings.xml");
-
-            if (IsRunning())
+            if (manager.IsBusy)
             {
-                if (MessageBox.Show("已启动下载进程，确认退出吗？", "请确认您的操作", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != System.Windows.Forms.DialogResult.Yes)
+                string msg = CurrentLanguage == "en"
+                    ? "Downloads are still running. Stop them and exit?"
+                    : "还有任务在下载，停止全部并退出吗？";
+                if (MessageBox.Show(msg, "M3U8 Downloader", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
                 {
                     e.Cancel = true;
                     return;
                 }
-                Process proc = m_proc;
-                m_stopRequested = true;
-                SendQuit(proc);
-                // 给 ffmpeg 几秒写完文件尾，超时再强杀；分片 MP4 被强杀也能播
-                try
-                {
-                    if (!proc.WaitForExit(5000))
-                        proc.Kill();
-                }
-                catch { }
+                Cursor = Cursors.WaitCursor;
+                // 每个 ffmpeg 发 q，最多一起等 5 秒，剩下的强杀；分片 MP4 被强杀也能播
+                manager.ShutdownBlocking(5000);
             }
+            SaveSettingsOnExit();
         }
 
         private void menu_Proxy_Click(object sender, EventArgs e)
         {
-            if (m_proxy.Length == 0 )
+            if (string.IsNullOrEmpty(m_proxy))
             {
                 MessageBox.Show("请设置代理后使用！" + Environment.NewLine + "Please select proxy!", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 menu_Proxy.CheckState = CheckState.Unchecked;
@@ -283,54 +644,36 @@ namespace M3U8_Downloader
             }
             if (!m_proxy.StartsWith("http://"))
             {
-                MessageBox.Show("代理地址格式错误！" + Environment.NewLine + "Thge proxy address format is incorrect!", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show("代理地址格式错误！" + Environment.NewLine + "The proxy address format is incorrect!", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 menu_Proxy.CheckState = CheckState.Unchecked;
                 return;
             }
-            if (menu_Proxy.CheckState == CheckState.Unchecked)
-            {
-                menu_Proxy.CheckState = CheckState.Checked;
-            }
-            else
-            {
-                menu_Proxy.CheckState = CheckState.Unchecked;
-            }
+            menu_Proxy.CheckState = menu_Proxy.CheckState == CheckState.Unchecked ? CheckState.Checked : CheckState.Unchecked;
         }
 
         private void menu_About_Click(object sender, EventArgs e)
         {
-            MessageBox.Show("magicdmer 编译于 2018/08/10\nCopyright ©  2018", "关于", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            MessageBox.Show("M3U8 Downloader " + AppVersion + "\n基于 magicdmer / nilaoda 的原版\n" + ReleasesUrl, "关于", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
         private void menu_Set_Click(object sender, EventArgs e)
         {
-            SetForm setDlg = new SetForm(CurrentLanguage);
+            SetForm setDlg = new SetForm(CurrentLanguage == "zh" ? "default" : CurrentLanguage);
             if (DialogResult.OK == setDlg.ShowDialog())
             {
                 m_path = setDlg.m_path;
-                m_proxy = setDlg.m_proxy;
+                m_proxy = setDlg.m_proxy ?? "";
             }
         }
 
         private void menu_FFmepg_Click(object sender, EventArgs e)
         {
-            Process.Start("https://ffmpeg.zeranoe.com/builds/win32/static/");
-        }
-
-        private void button_ForceStop_Click(object sender, EventArgs e)
-        {
-            m_stopRequested = true;
-            KillCurrent();
+            Process.Start("https://ffmpeg.org/download.html#build-windows");
         }
 
         private void 软件更新ToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            Process.Start("https://github.com/magicdmer/M3U8-Downloader");
-        }
-
-        private void button_OpenFolder_Click(object sender, EventArgs e)
-        {
-            Process.Start(m_path);
+            Process.Start(ReleasesUrl);
         }
 
         private void LanguageChinese_Click(object sender, EventArgs e)
@@ -343,293 +686,34 @@ namespace M3U8_Downloader
             ChangeLanguage("en");
         }
 
-
-
         private void ChangeLanguage(string languageCode)
         {
             CurrentLanguage = languageCode;
             ComponentResourceManager resources = new ComponentResourceManager(typeof(Form1));
-
+            var culture = new CultureInfo(languageCode);
             foreach (Control c in this.Controls)
             {
-                resources.ApplyResources(c, c.Name, new CultureInfo(languageCode));
-
+                if (c == listTasks || c == button_Clear || c == label_Parallel || c == numParallel)
+                    continue;
+                resources.ApplyResources(c, c.Name, culture);
                 if (c is MenuStrip)
                 {
                     foreach (ToolStripMenuItem menuitem in ((MenuStrip)c).Items)
                     {
-                        resources.ApplyResources(menuitem, menuitem.Name, new CultureInfo(languageCode));
-
-                        foreach (var submenuitem in ((ToolStripMenuItem)menuitem).DropDownItems)
-                        {
-                            if(submenuitem is ToolStripMenuItem)
-                            {
-                                resources.ApplyResources(submenuitem, ((ToolStripMenuItem)submenuitem).Name, new CultureInfo(languageCode));
-                            }
-                        }
+                        resources.ApplyResources(menuitem, menuitem.Name, culture);
+                        foreach (var submenuitem in menuitem.DropDownItems)
+                            if (submenuitem is ToolStripMenuItem)
+                                resources.ApplyResources(submenuitem, ((ToolStripMenuItem)submenuitem).Name, culture);
                     }
                 }
             }
+            // resx 会把旧的单任务坐标和文字套回来
+            textBox_forRegex.Visible = false;
+            label8.Visible = false;
+            label7.Visible = true;
+            label7.AutoSize = false;
+            ApplyLayout();
+            ApplyTexts();
         }
-    }
-}
-
-
-namespace M3U8_Downloader
-{
-    // 1.定义委托  
-    public delegate void DelReadStdOutput(string result);
-    public delegate void DelReadErrOutput(string result);
-
-    public partial class Form1 : Form
-    {
-        // 2.定义委托事件  
-        public event DelReadStdOutput ReadStdOutput;
-        public event DelReadErrOutput ReadErrOutput;
-        
-        private void button_Download_Click(object sender, EventArgs e)
-        {
-            if (!Directory.Exists(m_path))//若文件夹不存在则新建文件夹   
-            {
-                Directory.CreateDirectory(m_path); //新建文件夹   
-            }
-
-            if (textBox_Adress.Text.Length > 10)
-            {
-                m_outPut = "";
-                textBox_forRegex.Text = "";
-                ProgressBar.Value = 0;
-                Application.DoEvents();
-                label7.Visible = true;
-                Download();
-            }
-
-        }
-
-        string[] m_urlList;
-        int m_count;
-        string m_outPut;
-
-        private string BuildCommand(int index)
-        {
-            string line = (m_urlList[index] ?? "").Trim();
-            string roomId;
-            string input = line;
-            if (BilibiliLive.TryParseRoomId(line, out roomId))
-            {
-                LiveStream stream = BilibiliLive.Resolve(roomId);
-                input = stream.Url;
-                m_outPut += "Bilibili live " + roomId + " " + stream.FormatName + "/" + stream.CodecName + " qn=" + stream.Quality + "\r\n";
-            }
-            string output = UniqueOutputPath(m_path, textBox_Name.Text + index.ToString());
-            string proxy = menu_Proxy.Checked ? m_proxy : null;
-            if (BilibiliLive.TryParseRoomId(line, out roomId))
-                return BilibiliLive.BuildRecordCommand(input, output, proxy);
-            if (!string.IsNullOrWhiteSpace(proxy))
-                return "-http_proxy \"" + proxy + "\" -rw_timeout 10000000 -i \"" + input + "\" -c copy -y -bsf:a aac_adtstoasc " + FragmentedMp4Flags + " \"" + output + "\"";
-            return "-rw_timeout 10000000 -i \"" + input + "\" -c copy -y -bsf:a aac_adtstoasc " + FragmentedMp4Flags + " \"" + output + "\"";
-        }
-
-        // 分片 MP4：每个关键帧写一段可独立解码的数据，进程被强杀也能播放，
-        // 不依赖结尾才写的 moov（+faststart 恰恰要等到正常结束才写）。
-        public const string FragmentedMp4Flags = "-movflags +frag_keyframe+empty_moov+default_base_moof -flush_packets 1";
-
-        // 已有同名文件时依次试 "名字 (1).mp4"、"名字 (2).mp4"，不覆盖上一次的录制
-        static string UniqueOutputPath(string dir, string baseName)
-        {
-            string path = Path.Combine(dir, baseName + ".mp4");
-            for (int n = 1; File.Exists(path); n++)
-                path = Path.Combine(dir, baseName + " (" + n + ").mp4");
-            return path;
-        }
-
-        private void Download()
-        {
-            if (m_urlList != null || IsRunning())
-            {
-                MessageBox.Show("正在下载文件！" + Environment.NewLine + "Downloading file!", "M3U8 Downloader", MessageBoxButtons.OK, MessageBoxIcon.Information);  // 执行结束后触发
-                return;
-            }
-
-            //这个地方如果用split，会出现间隔空元素的情况
-            //m_urlList = textBox_Adress.Text.Split(Environment.NewLine.ToCharArray());
-            m_urlList = Regex.Split(textBox_Adress.Text, Environment.NewLine, RegexOptions.IgnoreCase);
-            m_count = 0;
-            m_stopRequested = false;
-
-            string command = BuildCommand(0);
-
-            // 启动进程执行相应命令,此例中以执行ffmpeg.exe为例  
-            RealAction(@"Tools\ffmpeg.exe", command);
-            m_count++;
-
-        }
-
-        private void RealAction(string StartFileName, string StartFileArg)
-        {
-            Process CmdProcess = new Process();
-            CmdProcess.StartInfo.FileName = StartFileName;      // 命令  
-            CmdProcess.StartInfo.Arguments = StartFileArg;      // 参数  
-
-            CmdProcess.StartInfo.CreateNoWindow = true;         // 不创建新窗口  
-            CmdProcess.StartInfo.UseShellExecute = false;
-            CmdProcess.StartInfo.RedirectStandardInput = true;  // 重定向输入  
-            CmdProcess.StartInfo.RedirectStandardOutput = true; // 重定向标准输出  
-            CmdProcess.StartInfo.RedirectStandardError = true;  // 重定向错误输出  
-            //CmdProcess.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;  
-
-            CmdProcess.OutputDataReceived += new DataReceivedEventHandler(p_OutputDataReceived);
-            CmdProcess.ErrorDataReceived += new DataReceivedEventHandler(p_ErrorDataReceived);
-
-            CmdProcess.EnableRaisingEvents = true;                      // 启用Exited事件  
-            CmdProcess.SynchronizingObject = this;                      // Exited 回到 UI 线程，避免和进度条更新抢线程
-            CmdProcess.Exited += new EventHandler(CmdProcess_Exited);   // 注册进程结束事件  
-
-            CmdProcess.Start();
-            m_proc = CmdProcess;
-            CmdProcess.BeginOutputReadLine();
-            CmdProcess.BeginErrorReadLine();
-
-            // 如果打开注释，则以同步方式执行命令，则会卡死，不会捕获命令输出。此例子中用Exited事件异步执行。  
-            //CmdProcess.WaitForExit();  
-        }
-
-        bool IsRunning()
-        {
-            try { return m_proc != null && !m_proc.HasExited; }
-            catch { return false; }
-        }
-
-        // 正常停止：给 ffmpeg 的 stdin 发 "q"，它会自己收尾写完文件。
-        // 旧做法 AttachConsole + SetConsoleCtrlHandler(NULL, TRUE) 会把"忽略 Ctrl+C"
-        // 遗传给之后启动的 ffmpeg，导致第二次下载点停止没反应。
-        public void Stop()
-        {
-            if (!IsRunning())
-                return;
-            m_stopRequested = true;
-            SendQuit(m_proc);
-
-            // 网络卡住时 ffmpeg 可能读不到 q；15 秒后仍未退出就强制结束
-            if (m_killTimer == null)
-            {
-                m_killTimer = new System.Windows.Forms.Timer();
-                m_killTimer.Interval = 15000;
-                m_killTimer.Tick += (s, ev) => { m_killTimer.Stop(); KillCurrent(); };
-            }
-            m_killTimer.Stop();
-            m_killTimer.Start();
-        }
-
-        static void SendQuit(Process proc)
-        {
-            try
-            {
-                proc.StandardInput.Write("q");
-                proc.StandardInput.Flush();
-            }
-            catch { }
-        }
-
-        void KillCurrent()
-        {
-            try
-            {
-                if (IsRunning())
-                    m_proc.Kill();
-            }
-            catch { }
-        }
-
-        //以下为实现异步输出CMD信息
-
-        private void Init()
-        {
-            //3.将相应函数注册到委托事件中  
-            ReadStdOutput += new DelReadStdOutput(ReadStdOutputAction);
-            ReadErrOutput += new DelReadErrOutput(ReadErrOutputAction);
-        }
-
-        private void p_OutputDataReceived(object sender, DataReceivedEventArgs e)
-        {
-            // 只认当前进程的输出：上一个进程退出后迟到的行不能再把进度条拨回走马灯
-            if (e.Data != null && ReferenceEquals(sender, m_proc))
-            {
-                // 4. 异步调用，需要invoke  
-                string data = e.Data;
-                // 到 UI 线程再核一次：排队期间可能已经换成下一个进程
-                this.BeginInvoke((MethodInvoker)(() => { if (ReferenceEquals(sender, m_proc)) ReadStdOutput(data); }));
-            }
-        }
-
-        private void p_ErrorDataReceived(object sender, DataReceivedEventArgs e)
-        {
-            if (e.Data != null && ReferenceEquals(sender, m_proc))
-            {
-                string data = e.Data;
-                this.BeginInvoke((MethodInvoker)(() => { if (ReferenceEquals(sender, m_proc)) ReadErrOutput(data); }));
-            }
-        }
-
-        private void ReadStdOutputAction(string result)
-        {
-            textBox_forRegex.Text = result;
-            m_outPut += (result + "\r\n");
-            textBox_Info_TextChanged();
-        }
-
-        private void ReadErrOutputAction(string result)
-        {
-            textBox_forRegex.Text = result;
-            m_outPut += (result + "\r\n");
-            textBox_Info_TextChanged();
-        }
-
-        private void CmdProcess_Exited(object sender, EventArgs e)
-        {
-            if (!ReferenceEquals(sender, m_proc))
-                return;
-            m_proc = null;
-            if (m_killTimer != null)
-                m_killTimer.Stop();
-
-            FlashWindow(this.Handle, true);
-            // 无论正常结束还是停止，都先让走马灯停下来
-            ProgressBar.Style = ProgressBarStyle.Continuous;
-
-            if (m_stopRequested)
-            {
-                m_urlList = null;
-                m_stopRequested = false;
-                this.Text = "M3U8 Downloader - 已停止";
-                ProgressBar.Value = 0;
-                windowsTaskbar.SetProgressState(TaskbarProgressBarState.NoProgress, this.Handle);
-            }
-            else if (m_count == m_urlList.Length)
-            {
-                m_urlList = null;
-                this.Text = "M3U8 Downloader 2.0 by nilaoda & magicdmer";
-                ProgressBar.Value = 100;
-                windowsTaskbar.SetProgressState(TaskbarProgressBarState.NoProgress, this.Handle);
-                Application.DoEvents();
-                MessageBox.Show("命令执行结束！", "M3U8 Downloader", MessageBoxButtons.OK, MessageBoxIcon.Information, MessageBoxDefaultButton.Button1, MessageBoxOptions.DefaultDesktopOnly);  // 执行结束后触发
-            }
-            else
-            {
-                m_outPut = "";
-                textBox_forRegex.Text = "";
-                this.Text = "[" + (m_count+1).ToString() + "/" + m_urlList.Length.ToString() + "]" + "已完成：0%";
-                ProgressBar.Value = 0;
-                windowsTaskbar.SetProgressValue(0, 100, this.Handle);
-                Application.DoEvents();
-
-                string command = BuildCommand(m_count);
-
-                
-                RealAction(@"Tools\ffmpeg.exe", command);
-
-                m_count++;
-            }
-        }  
     }
 }

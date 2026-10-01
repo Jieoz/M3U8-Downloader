@@ -196,10 +196,10 @@ namespace M3U8_Downloader
             var command = new StringBuilder();
             if (!string.IsNullOrWhiteSpace(httpProxy))
                 command.Append("-http_proxy ").Append(Quote(httpProxy.Trim())).Append(' ');
-            command.Append("-hide_banner -rw_timeout 15000000 -user_agent ").Append(Quote(UserAgent));
+            command.Append("-rw_timeout 15000000 -user_agent ").Append(Quote(UserAgent));
             command.Append(" -headers ").Append(Quote(FfmpegHeaders()));
             command.Append(" -i ").Append(Quote(inputUrl));
-            command.Append(" -c copy -y ").Append(Form1.FragmentedMp4Flags).Append(' ');
+            command.Append(" -c copy ").Append(DownloadManager.Mp4Flags).Append(' ');
             command.Append(Quote(outputPath));
             return command.ToString();
         }
@@ -301,7 +301,7 @@ namespace M3U8_Downloader
             }
         }
 
-        static string Quote(string value)
+        public static string Quote(string value)
         {
             return "\"" + (value ?? "").Replace("\"", "\\\"") + "\"";
         }
