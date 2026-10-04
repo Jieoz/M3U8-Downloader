@@ -60,6 +60,7 @@ namespace M3U8_Downloader
         internal VodCounter VodNames;   // Streamlink 不认识这个网页时，从同一批的点播序号里接着取名
         public string Anchor = "";      // 主播名
         public int Sessions;            // 已录场数
+        public bool Recording;          // 正在录（StartLine 置位、EndSession 复位）：EndSession 防重入用
         public DateTime NextCheck;      // Waiting 时下次检查的时间
         public string Note = "";        // 最近一次检查失败 / 上一场结束原因
         internal List<LiveStream> Lines = new List<LiveStream>();  // 这次开播查到的全部线路，好的在前
@@ -425,6 +426,29 @@ namespace M3U8_Downloader
             }
         }
 
+        // 盯播历史：输出目录下 历史.csv，一行一个事实（开播/下播/中断/检查失败/断档恢复/手动停止）。
+        // 「检查失败」= 轮询时接口没答上（含请求超时）；「断档恢复」= 超时窗口内开播了也没错过，
+        // 配合文件名里的开播时间，每场是否录到、断在哪，关掉软件也能事后翻账。
+        void LogLiveEvent(DownloadTask task, string ev, string detail)
+        {
+            try
+            {
+                string dir = OutputDir();
+                if (string.IsNullOrEmpty(dir)) return;
+                string room = task.RoomId.Length > 0 ? task.RoomId : task.Source;
+                string time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+                string path = Path.Combine(dir, "历史.csv");
+                using (var w = new StreamWriter(path, true, new UTF8Encoding(true)))   // 带 BOM：Excel 双击打开不乱码
+                    w.WriteLine(Csv(time) + "," + Csv(room) + "," + Csv(ev) + "," + Csv(detail));
+            }
+            catch { }   // 记录失败不影响盯播
+        }
+
+        static string Csv(string s)
+        {
+            return "\"" + (s ?? "").Replace("\"", "\"\"") + "\"";
+        }
+
         int NextInterval()
         {
             return LiveCheckIntervalMs + (LiveCheckJitterMs > 0 ? random.Next(LiveCheckJitterMs) : 0);
@@ -519,7 +543,10 @@ namespace M3U8_Downloader
                     Finish(task, TaskState.Failed, error);
                     return;
                 }
+                bool firstFail = task.Note.Length == 0;   // 连续失败只记第一笔，不刷屏
                 task.Note = "检查失败：" + error;
+                if (firstFail)
+                    LogLiveEvent(task, "检查失败", error);
                 Wait(task, NextInterval());
                 return;
             }
@@ -529,11 +556,14 @@ namespace M3U8_Downloader
                 return;
             }
 
+            if (task.Note.StartsWith("检查失败"))   // 断档结束：开播=断档恢复（没错过），仍离线=恢复检查
+                LogLiveEvent(task, status.Live ? "断档恢复" : "恢复检查", task.Note);
             task.Note = "";
             task.SessionStart = DateTime.Now;
             task.BaseName = LiveBaseName(task.Anchor, task.RoomId, task.SessionStart);
             task.Lines = status.Streams;
             task.LineIndex = 0;
+            LogLiveEvent(task, "开播", (task.Anchor.Length > 0 ? task.Anchor + "，" : "") + task.Lines.Count + " 条线路");
             StartLine(task);
         }
 
@@ -547,6 +577,7 @@ namespace M3U8_Downloader
             task.ProgressTime = null;
             task.ProgressSize = -1;
             lock (task.Tail) task.Tail.Clear();
+            task.Recording = true;
             LiveStream stream = task.Lines[task.LineIndex];
             task.Info = stream.FormatName + "/" + stream.CodecName + " " + stream.QualityName
                 + (task.Lines.Count > 1 ? " 线路 " + (task.LineIndex + 1) + "/" + task.Lines.Count : "");
@@ -573,6 +604,11 @@ namespace M3U8_Downloader
         // 一场录完（下播、断流且 ffmpeg 自己重连不上、或 ffmpeg 报错）：留下文件，接着等下一场
         void EndSession(DownloadTask task, int code)
         {
+            bool manual = task.KillRequested || task.StopRequested;   // OnExited 与 EndSession 都可能到这
+            if (!task.Recording) return;   // 防重入：已结束过/从未开始录（断档恢复路径误入）就不再记
+            task.Recording = false;
+            if (manual) return;   // 手动停止由 AfterExit 记「手动停止」，这里不重复
+
             try { task.SizeBytes = new FileInfo(task.OutputPath).Length; } catch { }
             double ran = (DateTime.Now - task.SessionStart).TotalSeconds;
             if (task.Proc != null)
@@ -597,6 +633,9 @@ namespace M3U8_Downloader
             else
                 task.Sessions++;
             task.Lines = new List<LiveStream>();
+            if (!manual)
+                LogLiveEvent(task, wrote ? (code == 0 ? "下播" : "中断") : "所有线路连不上",
+                    task.BaseName + (wrote ? "，" + FormatSize(task.SizeBytes) : "，" + LastError(task, code)));
             task.Note = code == 0 ? "上一场已结束" : (wrote ? "上一场中断：" : "所有线路都连不上：") + LastError(task, code);
             // 刚开就断（多半是地址失效或被拒）：等 30 秒再查，别连着打接口；否则 2 秒后确认是不是真下播了
             Wait(task, ran < 60 ? Math.Min(30000, LiveCheckIntervalMs) : 2000);
@@ -768,7 +807,10 @@ namespace M3U8_Downloader
         {
             // 手动停掉的直播这场也算录过（重新开始后场数接着累计）
             if (task.IsLive && (task.KillRequested || task.StopRequested) && task.SizeBytes > 0)
+            {
                 task.Sessions++;
+                LogLiveEvent(task, "手动停止", task.BaseName + "，已录 " + FormatSize(task.SizeBytes));
+            }
             if (task.KillRequested)
                 Finish(task, TaskState.Killed, null);
             else if (task.StopRequested)
@@ -852,6 +894,11 @@ namespace M3U8_Downloader
         {
             string[] lines = text.Trim().Split('\n');
             return lines[lines.Length - 1].Trim();
+        }
+
+        static string FormatSize(long bytes)
+        {
+            return (bytes / 1048576.0).ToString("0.0", CultureInfo.InvariantCulture) + "MB";
         }
 
         static string LastError(DownloadTask task, int code)
