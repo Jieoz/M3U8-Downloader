@@ -544,20 +544,27 @@ namespace M3U8_Downloader
                     return;
                 }
                 bool firstFail = task.Note.Length == 0;   // 连续失败只记第一笔，不刷屏
-                task.Note = "检查失败：" + error;
+                task.Note = "检查失败：" + error + "（" + DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + "）";
                 if (firstFail)
                     LogLiveEvent(task, "检查失败", error);
                 Wait(task, NextInterval());
                 return;
             }
+            bool afterFail = task.Note.StartsWith("检查失败");
             if (!status.Live)
             {
+                if (afterFail)
+                {
+                    // 仍离线=恢复检查；界面从「检查失败…」换成「检查已恢复」，不再残留旧错误
+                    LogLiveEvent(task, "恢复检查", task.Note);
+                    task.Note = "检查已恢复（" + DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + "）";
+                }
                 Wait(task, NextInterval());
                 return;
             }
 
-            if (task.Note.StartsWith("检查失败"))   // 断档结束：开播=断档恢复（没错过），仍离线=恢复检查
-                LogLiveEvent(task, status.Live ? "断档恢复" : "恢复检查", task.Note);
+            if (afterFail)   // 开播=断档恢复（超时/断网期间播了，没错过）
+                LogLiveEvent(task, "断档恢复", task.Note);
             task.Note = "";
             task.SessionStart = DateTime.Now;
             task.BaseName = LiveBaseName(task.Anchor, task.RoomId, task.SessionStart);
